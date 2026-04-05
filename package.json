@@ -1,0 +1,21 @@
+{
+  "name": "watchparty",
+  "version": "1.0.0",
+  "description": "Social & Collaborative Viewing Platform",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "jest --testEnvironment node --forceExit"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.5",
+    "uuidv7": "^1.0.2",
+    "ws": "^8.17.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^7.0.0"
+  }
+}
