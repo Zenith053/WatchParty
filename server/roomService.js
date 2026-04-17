@@ -24,7 +24,7 @@ function makeInviteToken() {
 }
 
 function inviteLink(req, roomId, token) {
-  const base = process.env.BASE_URL ||
+  const base = process.env.WP_BASE_URL ||
     `${req.protocol}://${req.get('host')}`;
   return `${base}/room.html?roomId=${roomId}&token=${token}`;
 }
@@ -137,4 +137,16 @@ async function promoteToHost(roomId, targetUserId) {
   );
 }
 
-module.exports = { createRoom, joinRoom, promoteToHost };
+/**
+ * Get the count of connected members in a room (from DB).
+ * Used by FR-06 skip vote majority calculation.
+ */
+async function getMemberCount(roomId) {
+  const { rows } = await query(
+    `SELECT COUNT(*)::int AS count FROM room_members WHERE room_id = $1`,
+    [roomId]
+  );
+  return rows[0]?.count ?? 0;
+}
+
+module.exports = { createRoom, joinRoom, promoteToHost, getMemberCount };

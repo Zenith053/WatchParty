@@ -19,7 +19,7 @@ const { initDb }          = require('./db');
 const { router, staticMiddleware } = require('./gateway');
 const { handleConnection } = require('./syncService');
 
-const PORT = parseInt(process.env.PORT ?? '3000', 10);
+const PORT = parseInt(process.env.WP_PORT ?? '3000', 10);
 
 async function main() {
   // 1. Initialise Postgres schema (idempotent)

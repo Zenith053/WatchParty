@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://localhost:5432/watchparty',
+  connectionString: process.env.WP_DATABASE_URL || 'postgresql://localhost:5432/watchparty',
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
@@ -28,7 +28,7 @@ pool.on('error', (err) => {
 async function query(text, params) {
   const start = Date.now();
   const res = await pool.query(text, params);
-  if (process.env.NODE_ENV !== 'test') {
+  if (process.env.WP_NODE_ENV !== 'test') {
     console.debug(`[db] query took ${Date.now() - start}ms — ${text.slice(0, 60)}`);
   }
   return res;

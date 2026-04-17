@@ -4,6 +4,8 @@
  * FR-02 Playback Sync:   host PLAY/PAUSE/SEEK → broadcast to all guests (≤1 s, NFR-01)
  * FR-03 Late-Join:       CATCHUP snapshot sent immediately on JOIN
  * FR-04 Host/Guest:      non-host commands are rejected
+ * FR-05 Vote-to-Watch:   QUEUE_ADD/UPVOTE/REMOVE → broadcast updated queue
+ * FR-06 Skip Vote:       SKIP_VOTE → majority check → auto-play next from queue
  * FR-07 Host Migration:  host dropout → oldest guest promoted within 3 s (NFR-03)
  *
  * Message envelope (JSON):
@@ -14,6 +16,11 @@
  *     { type: 'SEEK',   position }
  *     { type: 'LOAD',   url }          — host loads a new video URL
  *     { type: 'GRANT_COHOST', targetUserId }
+ *     { type: 'QUEUE_ADD',    url }     — any member nominates a video
+ *     { type: 'QUEUE_UPVOTE', queueId } — any member upvotes
+ *     { type: 'QUEUE_REMOVE', queueId } — host only
+ *     { type: 'SKIP_VOTE' }            — any member votes to skip
+ *     { type: 'VIDEO_ENDED' }          — client signals video finished
  *
  *   Server → Client:
  *     { type: 'PLAY',         position }
@@ -23,12 +30,18 @@
  *     { type: 'CATCHUP',      position, status, url }
  *     { type: 'HOST_PROMOTED', userId }   — sent to newly promoted host
  *     { type: 'MEMBER_LIST',   members }
+ *     { type: 'QUEUE_UPDATE',  queue }    — full queue list broadcast
+ *     { type: 'SKIP_STATUS',   count, needed } — skip vote progress
  *     { type: 'ERROR',         message }
  */
 'use strict';
 
 const { setState, getState } = require('./stateStore');
 const { promoteToHost }       = require('./roomService');
+const {
+  addToQueue, upvoteQueue, getQueue, popTopEntry,
+  removeFromQueue, voteSkip, checkSkipMajority, clearSkipVotes,
+} = require('./queueService');
 
 // roomId → Map<userId, { ws, role, joinedAt }>
 const rooms = new Map();
@@ -64,6 +77,58 @@ function broadcastMemberList(roomId) {
 
 function isAuthorised(role) {
   return role === 'host' || role === 'co-host';
+}
+
+/**
+ * Broadcast the current queue list to all room members (FR-05).
+ */
+async function broadcastQueue(roomId) {
+  try {
+    const queue = await getQueue(roomId);
+    broadcast(roomId, { type: 'QUEUE_UPDATE', queue });
+  } catch (err) {
+    console.error('[sync] broadcastQueue error:', err.message);
+  }
+}
+
+/**
+ * Broadcast skip vote status to all room members (FR-06).
+ */
+function broadcastSkipStatus(roomId, count) {
+  const members = rooms.get(roomId);
+  const totalMembers = members ? members.size : 0;
+  const needed = Math.floor(totalMembers / 2) + 1;
+  broadcast(roomId, { type: 'SKIP_STATUS', count, needed });
+}
+
+/**
+ * Auto-play the next video from the queue (FR-05).
+ * Called when current video ends or skip majority is reached (FR-06).
+ */
+async function playNextFromQueue(roomId) {
+  try {
+    const entry = await popTopEntry(roomId);
+    if (!entry) {
+      broadcast(roomId, { type: 'QUEUE_EMPTY' });
+      return;
+    }
+
+    const url = normaliseUrl(entry.url) || entry.url;
+    await setState(roomId, { url, position: 0, status: 'playing' });
+    await clearSkipVotes(roomId);
+
+    broadcast(roomId, { type: 'LOAD', url });
+    // Auto-play after a brief delay for iframe load
+    setTimeout(() => {
+      broadcast(roomId, { type: 'PLAY', position: 0 });
+    }, 500);
+
+    await broadcastQueue(roomId);
+    broadcastSkipStatus(roomId, 0);
+    console.log(`[sync] Auto-playing next from queue in room ${roomId}: ${url}`);
+  } catch (err) {
+    console.error('[sync] playNextFromQueue error:', err.message);
+  }
 }
 
 // ── Host Migration (FR-07 / NFR-03) ────────────────────────────────────────
@@ -141,6 +206,13 @@ function handleConnection(ws, _req) {
       }
 
       broadcastMemberList(roomId);
+
+      // Send current queue to the new joiner (FR-05)
+      try {
+        const queue = await getQueue(roomId);
+        send(ws, { type: 'QUEUE_UPDATE', queue });
+      } catch { /* DB unavailable */ }
+
       console.log(`[sync] ${userId} (${userRole}) joined room ${roomId}`);
       return;
     }
@@ -166,7 +238,9 @@ function handleConnection(ws, _req) {
         return;
       }
       await setState(roomId, { url, position: 0, status: 'paused' });
+      await clearSkipVotes(roomId);
       broadcast(roomId, { type: 'LOAD', url });
+      broadcastSkipStatus(roomId, 0);
       return;
     }
 
@@ -199,6 +273,97 @@ function handleConnection(ws, _req) {
       target.role = 'co-host';
       send(target.ws, { type: 'HOST_PROMOTED', role: 'co-host', userId: msg.targetUserId });
       broadcastMemberList(roomId);
+      return;
+    }
+
+    // ── QUEUE_ADD (FR-05) — any member can nominate ───────────────────────
+    if (msg.type === 'QUEUE_ADD') {
+      const rawUrl = (msg.url ?? '').trim();
+      if (!rawUrl) {
+        send(ws, { type: 'ERROR', message: 'URL is required' });
+        return;
+      }
+      try {
+        await addToQueue(roomId, rawUrl, userId);
+        await broadcastQueue(roomId);
+      } catch (err) {
+        send(ws, { type: 'ERROR', message: 'Failed to add to queue' });
+        console.error('[sync] QUEUE_ADD error:', err.message);
+      }
+      return;
+    }
+
+    // ── QUEUE_UPVOTE (FR-05) — any member can upvote ─────────────────────
+    if (msg.type === 'QUEUE_UPVOTE') {
+      const queueId = parseInt(msg.queueId, 10);
+      if (!queueId) {
+        send(ws, { type: 'ERROR', message: 'Invalid queueId' });
+        return;
+      }
+      try {
+        const result = await upvoteQueue(queueId, userId);
+        if (!result.success) {
+          send(ws, { type: 'ERROR', message: result.error });
+          return;
+        }
+        await broadcastQueue(roomId);
+      } catch (err) {
+        send(ws, { type: 'ERROR', message: 'Failed to upvote' });
+        console.error('[sync] QUEUE_UPVOTE error:', err.message);
+      }
+      return;
+    }
+
+    // ── QUEUE_REMOVE (FR-05) — host only ─────────────────────────────────
+    if (msg.type === 'QUEUE_REMOVE') {
+      if (!isAuthorised(userRole)) {
+        send(ws, { type: 'ERROR', message: 'Only host can remove queue entries' });
+        return;
+      }
+      const queueId = parseInt(msg.queueId, 10);
+      if (!queueId) {
+        send(ws, { type: 'ERROR', message: 'Invalid queueId' });
+        return;
+      }
+      try {
+        await removeFromQueue(queueId);
+        await broadcastQueue(roomId);
+      } catch (err) {
+        send(ws, { type: 'ERROR', message: 'Failed to remove from queue' });
+        console.error('[sync] QUEUE_REMOVE error:', err.message);
+      }
+      return;
+    }
+
+    // ── SKIP_VOTE (FR-06) — any member can vote to skip ──────────────────
+    if (msg.type === 'SKIP_VOTE') {
+      try {
+        const result = await voteSkip(roomId, userId);
+        if (!result.success) {
+          send(ws, { type: 'ERROR', message: result.error });
+          return;
+        }
+
+        const totalMembers = rooms.get(roomId)?.size ?? 0;
+        broadcastSkipStatus(roomId, result.count);
+
+        // Check majority → auto-play next
+        if (checkSkipMajority(result.count, totalMembers)) {
+          await playNextFromQueue(roomId);
+        }
+      } catch (err) {
+        send(ws, { type: 'ERROR', message: 'Failed to register skip vote' });
+        console.error('[sync] SKIP_VOTE error:', err.message);
+      }
+      return;
+    }
+
+    // ── VIDEO_ENDED — auto-play next from queue ─────────────────────────
+    if (msg.type === 'VIDEO_ENDED') {
+      // Only process from host to avoid duplicates
+      if (isAuthorised(userRole)) {
+        await playNextFromQueue(roomId);
+      }
       return;
     }
 

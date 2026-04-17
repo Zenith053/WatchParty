@@ -4,6 +4,8 @@
  * FR-02: Applies host PLAY/PAUSE/SEEK to the YouTube IFrame player
  * FR-03: Handles CATCHUP message → seeks to current position on join
  * FR-04: Role-gates controls (host shows controls bar; guest sees message)
+ * FR-05: Queue management — add, upvote, remove entries
+ * FR-06: Skip vote — majority-based skip mechanic
  * FR-07: Handles HOST_PROMOTED → unlocks controls if this client is promoted
  */
 'use strict';
@@ -43,6 +45,16 @@ const timeCurrent    = $('time-current');
 const timeTotal      = $('time-total');
 const inviteDisplay  = $('invite-display');
 
+// Queue DOM refs (FR-05)
+const queueUrlInput  = $('queue-url-input');
+const queueList      = $('queue-list');
+const queueEmpty     = $('queue-empty');
+const queueCount     = $('queue-count');
+
+// Skip DOM refs (FR-06)
+const skipSection    = $('skip-section');
+const skipProgress   = $('skip-progress');
+
 // ── Toast helper ──────────────────────────────────────────────────────────
 function toast(message, type = 'info', durationMs = 3500) {
   const icons = { error: '❌', success: '✅', info: 'ℹ️', warn: '⚠️' };
@@ -54,6 +66,15 @@ function toast(message, type = 'info', durationMs = 3500) {
     el.style.animation = 'fadeOut 400ms ease forwards';
     el.addEventListener('animationend', () => el.remove(), { once: true });
   }, durationMs);
+}
+
+// ── Sidebar Tab Switcher ──────────────────────────────────────────────────
+function switchSidebarTab(tab) {
+  ['room', 'queue'].forEach(t => {
+    $(`stab-${t}`).classList.toggle('active', t === tab);
+    $(`stab-${t}`).setAttribute('aria-selected', String(t === tab));
+    $(`spanel-${t}`).classList.toggle('active', t === tab);
+  });
 }
 
 // ── Role UI ───────────────────────────────────────────────────────────────
@@ -158,6 +179,10 @@ window.addEventListener('message', (ev) => {
     if (data.info?.duration) {
       localDuration = data.info.duration;
     }
+    // Detect video ended (playerState 0)
+    if (data.info?.playerState === 0) {
+      onVideoEnded();
+    }
     updateSeekBar();
     updateTimestamp();
   } catch { /* non-JSON message from another source */ }
@@ -174,6 +199,15 @@ function updateSeekBar() {
 
 function updateTimestamp() {
   timeCurrent.textContent = fmt(localPosition);
+}
+
+/**
+ * FR-05: When the current video ends, notify the server to auto-play next.
+ */
+function onVideoEnded() {
+  if (role === 'host' || role === 'co-host') {
+    ws.send(JSON.stringify({ type: 'VIDEO_ENDED' }));
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -278,6 +312,21 @@ function handleMessage(msg) {
       renderMembers(msg.members ?? []);
       break;
 
+    // FR-05: Queue update
+    case 'QUEUE_UPDATE':
+      renderQueue(msg.queue ?? []);
+      break;
+
+    // FR-06: Skip vote status
+    case 'SKIP_STATUS':
+      updateSkipProgress(msg.count ?? 0, msg.needed ?? 0);
+      break;
+
+    // FR-05: Queue is empty (no next video)
+    case 'QUEUE_EMPTY':
+      toast('Queue is empty — no next video.', 'info');
+      break;
+
     case 'ERROR':
       toast(msg.message, 'error');
       break;
@@ -301,6 +350,115 @@ function renderMembers(members) {
     `;
     memberList.appendChild(el);
   });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// FR-05: Queue UI
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Render the queue list from server data.
+ */
+function renderQueue(queue) {
+  queueCount.textContent = `(${queue.length})`;
+  queueList.innerHTML = '';
+
+  if (queue.length === 0) {
+    const emptyEl = document.createElement('div');
+    emptyEl.className = 'queue-empty-msg';
+    emptyEl.textContent = 'No videos in queue yet. Nominate one above!';
+    queueList.appendChild(emptyEl);
+    return;
+  }
+
+  queue.forEach((entry, idx) => {
+    const el = document.createElement('div');
+    el.className = 'queue-item';
+    el.dataset.queueId = entry.id;
+
+    // Extract a friendly display name from the URL
+    const displayUrl = extractVideoLabel(entry.url);
+
+    let removeBtn = '';
+    if (role === 'host' || role === 'co-host') {
+      removeBtn = `<button class="queue-remove-btn" onclick="removeFromQueue(${entry.id})" aria-label="Remove from queue">✕</button>`;
+    }
+
+    el.innerHTML = `
+      <span class="queue-rank">#${idx + 1}</span>
+      <div class="queue-info">
+        <span class="queue-url" title="${entry.url}">${displayUrl}</span>
+        <span class="queue-meta">Added by ${entry.added_by === userId ? 'you' : entry.added_by?.slice(0, 8) + '…'}</span>
+      </div>
+      <div class="queue-actions">
+        <button class="queue-vote-btn" onclick="upvoteQueue(${entry.id})" aria-label="Upvote">
+          ▲ ${entry.upvotes}
+        </button>
+        ${removeBtn}
+      </div>
+    `;
+    queueList.appendChild(el);
+  });
+}
+
+/**
+ * Extract a human-readable label from a video URL.
+ */
+function extractVideoLabel(url) {
+  try {
+    const u = new URL(url);
+    // YouTube
+    const v = u.searchParams.get('v');
+    if (v) return `youtube.com/watch?v=${v}`;
+    if (u.hostname === 'youtu.be') return `youtu.be/${u.pathname.slice(1)}`;
+    // Fallback
+    return u.hostname + u.pathname;
+  } catch {
+    return url.length > 40 ? url.slice(0, 40) + '…' : url;
+  }
+}
+
+/**
+ * Add a video to the queue (FR-05).
+ */
+function addToQueue() {
+  const url = queueUrlInput.value.trim();
+  if (!url) { toast('Enter a YouTube URL to nominate.', 'error'); return; }
+  ws.send(JSON.stringify({ type: 'QUEUE_ADD', url }));
+  queueUrlInput.value = '';
+  toast('Video added to queue!', 'success');
+}
+
+/**
+ * Upvote a queue entry (FR-05).
+ */
+function upvoteQueue(queueId) {
+  ws.send(JSON.stringify({ type: 'QUEUE_UPVOTE', queueId }));
+}
+
+/**
+ * Remove a queue entry — host only (FR-05).
+ */
+function removeFromQueue(queueId) {
+  ws.send(JSON.stringify({ type: 'QUEUE_REMOVE', queueId }));
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// FR-06: Skip Vote UI
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Vote to skip the current video (FR-06).
+ */
+function voteSkip() {
+  ws.send(JSON.stringify({ type: 'SKIP_VOTE' }));
+}
+
+/**
+ * Update the skip vote progress display.
+ */
+function updateSkipProgress(count, needed) {
+  skipProgress.textContent = `${count} / ${needed} votes`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -353,6 +511,7 @@ function leaveRoom() {
 
 // ── Enter url with Enter key ──────────────────────────────────────────────
 urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') loadVideo(); });
+queueUrlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') addToQueue(); });
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 (function init() {

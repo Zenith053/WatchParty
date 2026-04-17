@@ -1,6 +1,6 @@
 /**
  * tests/sync.test.js
- * Integration tests for syncService WebSocket hub (FR-02, FR-03, FR-04, FR-07)
+ * Integration tests for syncService WebSocket hub (FR-02, FR-03, FR-04, FR-05, FR-06, FR-07)
  * Spins up a real ws.Server on a random port; uses ws client.
  */
 'use strict';
@@ -21,9 +21,60 @@ jest.mock('../server/stateStore', () => {
 });
 
 jest.mock('../server/roomService', () => ({
-  createRoom:    jest.fn(),
-  joinRoom:      jest.fn(),
-  promoteToHost: jest.fn().mockResolvedValue(undefined),
+  createRoom:     jest.fn(),
+  joinRoom:       jest.fn(),
+  promoteToHost:  jest.fn().mockResolvedValue(undefined),
+  getMemberCount: jest.fn().mockResolvedValue(2),
+}));
+
+// Mock queueService for integration tests
+const mockQueueStore = [];
+let mockQueueId = 100;
+const mockQueueVotes = new Map();
+const mockSkipVotes  = new Map();
+
+jest.mock('../server/queueService', () => ({
+  addToQueue:     jest.fn(async (roomId, url, userId) => {
+    const entry = { id: mockQueueId++, room_id: roomId, url, added_by: userId, upvotes: 0, added_at: new Date().toISOString() };
+    mockQueueStore.push(entry);
+    return entry;
+  }),
+  upvoteQueue:    jest.fn(async (queueId, userId) => {
+    const key = `${queueId}-${userId}`;
+    if (mockQueueVotes.has(key)) return { success: false, error: 'Already upvoted' };
+    mockQueueVotes.set(key, true);
+    const entry = mockQueueStore.find(e => e.id === queueId);
+    if (entry) entry.upvotes++;
+    return { success: true, upvotes: entry?.upvotes ?? 0 };
+  }),
+  getQueue:       jest.fn(async (roomId) =>
+    mockQueueStore.filter(e => e.room_id === roomId).sort((a, b) => b.upvotes - a.upvotes)
+  ),
+  popTopEntry:    jest.fn(async (roomId) => {
+    const sorted = mockQueueStore.filter(e => e.room_id === roomId).sort((a, b) => b.upvotes - a.upvotes);
+    if (sorted.length === 0) return null;
+    const top = sorted[0];
+    const idx = mockQueueStore.findIndex(e => e.id === top.id);
+    mockQueueStore.splice(idx, 1);
+    return top;
+  }),
+  removeFromQueue: jest.fn(async (queueId) => {
+    const idx = mockQueueStore.findIndex(e => e.id === queueId);
+    if (idx >= 0) mockQueueStore.splice(idx, 1);
+  }),
+  voteSkip:       jest.fn(async (roomId, userId) => {
+    const key = `${roomId}-${userId}`;
+    if (mockSkipVotes.has(key)) return { success: false, count: 0, error: 'Already voted to skip' };
+    mockSkipVotes.set(key, true);
+    let count = 0;
+    for (const k of mockSkipVotes.keys()) { if (k.startsWith(`${roomId}-`)) count++; }
+    return { success: true, count };
+  }),
+  getSkipCount:    jest.fn(async () => 0),
+  checkSkipMajority: jest.fn((count, total) => count > total / 2),
+  clearSkipVotes:  jest.fn(async (roomId) => {
+    for (const k of [...mockSkipVotes.keys()]) { if (k.startsWith(`${roomId}-`)) mockSkipVotes.delete(k); }
+  }),
 }));
 
 const http = require('http');
@@ -64,6 +115,22 @@ function nextMsg(ws) {
 
 function send(ws, obj) { ws.send(JSON.stringify(obj)); }
 
+/**
+ * Drain messages until we find one matching the given type, or timeout.
+ */
+async function waitForMsg(ws, type, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const msg = await Promise.race([
+      nextMsg(ws),
+      new Promise(r => setTimeout(() => r({ type: '__timeout__' }), 300)),
+    ]);
+    if (msg.type === type) return msg;
+    if (msg.type === '__timeout__') continue;
+  }
+  return null;
+}
+
 // ── Suite setup ───────────────────────────────────────────────────────────
 
 let server, port;
@@ -71,6 +138,13 @@ const ROOM = 'test-room-001';
 
 beforeAll(async () => ({ server, port } = await startServer()));
 afterAll(()  => server.close());
+
+beforeEach(() => {
+  mockQueueStore.length = 0;
+  mockQueueVotes.clear();
+  mockSkipVotes.clear();
+  mockQueueId = 100;
+});
 
 // ── FR-04: Role gating ────────────────────────────────────────────────────
 
@@ -157,20 +231,104 @@ describe('FR-03 Late-join catch-up', () => {
     const ws = await connect(port);
     send(ws, { type: 'JOIN', roomId: rid, userId: 'late1', role: 'guest', displayName: 'LateJoiner' });
 
-    let catchup = null;
-    const deadline = Date.now() + 2000;
-    while (!catchup && Date.now() < deadline) {
-      const msg = await Promise.race([
-        nextMsg(ws),
-        new Promise(r => setTimeout(() => r({ type: '__timeout__' }), 500)),
-      ]);
-      if (msg.type === 'CATCHUP') catchup = msg;
-    }
+    const catchup = await waitForMsg(ws, 'CATCHUP');
 
     expect(catchup).not.toBeNull();
     expect(catchup.position).toBe(222);
     expect(catchup.status).toBe('playing');
     ws.close();
+  });
+});
+
+// ── FR-05: Queue via WebSocket ───────────────────────────────────────────
+
+describe('FR-05 Queue via WebSocket', () => {
+  test('QUEUE_ADD broadcasts QUEUE_UPDATE to all members', async () => {
+    const rid = `${ROOM}-qadd`;
+    const [hostWs, guestWs] = await Promise.all([connect(port), connect(port)]);
+
+    send(hostWs,  { type: 'JOIN', roomId: rid, userId: 'qh1', role: 'host',  displayName: 'QHost' });
+    send(guestWs, { type: 'JOIN', roomId: rid, userId: 'qg1', role: 'guest', displayName: 'QGuest' });
+
+    // Drain join messages
+    await waitForMsg(hostWs, 'MEMBER_LIST');
+    await waitForMsg(guestWs, 'MEMBER_LIST');
+
+    send(guestWs, { type: 'QUEUE_ADD', url: 'https://youtube.com/watch?v=test1' });
+
+    // Both should receive QUEUE_UPDATE
+    const hostUpdate = await waitForMsg(hostWs, 'QUEUE_UPDATE');
+    expect(hostUpdate).not.toBeNull();
+    expect(hostUpdate.queue.length).toBe(1);
+    expect(hostUpdate.queue[0].url).toContain('test1');
+
+    hostWs.close();
+    guestWs.close();
+  });
+
+  test('QUEUE_UPVOTE updates vote count for all members', async () => {
+    const rid = `${ROOM}-qup`;
+    const [hostWs, guestWs] = await Promise.all([connect(port), connect(port)]);
+
+    send(hostWs,  { type: 'JOIN', roomId: rid, userId: 'qh2', role: 'host',  displayName: 'QHost2' });
+    send(guestWs, { type: 'JOIN', roomId: rid, userId: 'qg2', role: 'guest', displayName: 'QGuest2' });
+
+    await waitForMsg(hostWs, 'MEMBER_LIST');
+    await waitForMsg(guestWs, 'MEMBER_LIST');
+
+    // Add an entry first
+    send(hostWs, { type: 'QUEUE_ADD', url: 'https://youtube.com/watch?v=uv' });
+    const addUpdate = await waitForMsg(guestWs, 'QUEUE_UPDATE');
+    const queueId = addUpdate.queue[0].id;
+
+    // Upvote from guest
+    send(guestWs, { type: 'QUEUE_UPVOTE', queueId });
+    const upUpdate = await waitForMsg(hostWs, 'QUEUE_UPDATE');
+    expect(upUpdate).not.toBeNull();
+    expect(upUpdate.queue[0].upvotes).toBe(1);
+
+    hostWs.close();
+    guestWs.close();
+  });
+
+  test('non-host QUEUE_REMOVE is rejected', async () => {
+    const rid = `${ROOM}-qrem`;
+    const guestWs = await connect(port);
+
+    send(guestWs, { type: 'JOIN', roomId: rid, userId: 'qg3', role: 'guest', displayName: 'QGuest3' });
+    await waitForMsg(guestWs, 'MEMBER_LIST');
+
+    send(guestWs, { type: 'QUEUE_REMOVE', queueId: 999 });
+    const err = await waitForMsg(guestWs, 'ERROR');
+    expect(err).not.toBeNull();
+    expect(err.message).toMatch(/host/i);
+
+    guestWs.close();
+  });
+});
+
+// ── FR-06: Skip Vote via WebSocket ───────────────────────────────────────
+
+describe('FR-06 Skip Vote via WebSocket', () => {
+  test('SKIP_VOTE broadcasts SKIP_STATUS to all members', async () => {
+    const rid = `${ROOM}-skip`;
+    const [hostWs, guestWs] = await Promise.all([connect(port), connect(port)]);
+
+    send(hostWs,  { type: 'JOIN', roomId: rid, userId: 'sh1', role: 'host',  displayName: 'SkipHost' });
+    send(guestWs, { type: 'JOIN', roomId: rid, userId: 'sg1', role: 'guest', displayName: 'SkipGuest' });
+
+    await waitForMsg(hostWs, 'MEMBER_LIST');
+    await waitForMsg(guestWs, 'MEMBER_LIST');
+
+    send(guestWs, { type: 'SKIP_VOTE' });
+
+    const status = await waitForMsg(hostWs, 'SKIP_STATUS');
+    expect(status).not.toBeNull();
+    expect(status.count).toBe(1);
+    expect(status.needed).toBeGreaterThan(0);
+
+    hostWs.close();
+    guestWs.close();
   });
 });
 
@@ -203,5 +361,7 @@ describe('FR-07 Host migration', () => {
 
     expect(promoted.type).toBe('HOST_PROMOTED');
     guest.close();
+    // Allow cleanup logs to fire before Jest exits
+    await new Promise(r => setTimeout(r, 200));
   }, 5000 /* allow 5 s for this test */);
 });
