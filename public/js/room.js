@@ -57,6 +57,14 @@ const queueCount     = $('queue-count');
 const skipSection    = $('skip-section');
 const skipProgress   = $('skip-progress');
 
+// Chat DOM refs (FR-10)
+const chatMessages   = $('chat-messages');
+const chatInput      = $('chat-input');
+const chatEmpty      = $('chat-empty');
+
+// Display Name refs (FR-08)
+const nameInput      = $('name-input');
+
 // ── Toast helper ──────────────────────────────────────────────────────────
 function toast(message, type = 'info', durationMs = 3500) {
   const icons = { error: '❌', success: '✅', info: 'ℹ️', warn: '⚠️' };
@@ -72,11 +80,15 @@ function toast(message, type = 'info', durationMs = 3500) {
 
 // ── Sidebar Tab Switcher ──────────────────────────────────────────────────
 function switchSidebarTab(tab) {
-  ['room', 'queue'].forEach(t => {
+  ['room', 'chat', 'queue'].forEach(t => {
     $(`stab-${t}`).classList.toggle('active', t === tab);
     $(`stab-${t}`).setAttribute('aria-selected', String(t === tab));
     $(`spanel-${t}`).classList.toggle('active', t === tab);
   });
+  // Auto-scroll chat to bottom when switching to chat tab
+  if (tab === 'chat' && chatMessages) {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
 }
 
 // ── Role UI ───────────────────────────────────────────────────────────────
@@ -803,6 +815,21 @@ function handleMessage(msg) {
       updateSkipProgress(msg.count ?? 0, msg.needed ?? 0);
       break;
 
+    // FR-10: Chat message received
+    case 'CHAT_MSG':
+      renderChatMessage(msg);
+      break;
+
+    // FR-10: Emoji reaction received
+    case 'CHAT_REACTION':
+      renderChatReaction(msg);
+      break;
+
+    // FR-10: Chat history for late joiners
+    case 'CHAT_HISTORY':
+      renderChatHistory(msg.messages ?? []);
+      break;
+
     // FR-05: Queue is empty (no next video)
     case 'QUEUE_EMPTY':
       toast('Queue is empty — no next video.', 'info');
@@ -946,6 +973,130 @@ function voteSkip() {
  */
 function updateSkipProgress(count, needed) {
   skipProgress.textContent = `${count} / ${needed} votes`;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// FR-10: Live Chat
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Send a chat message.
+ */
+function sendChat() {
+  const text = chatInput.value.trim();
+  if (!text) return;
+  sendWs({ type: 'CHAT_MSG', text });
+  chatInput.value = '';
+}
+
+/**
+ * Send an emoji reaction.
+ */
+function sendReaction(emoji) {
+  sendWs({ type: 'CHAT_REACTION', emoji });
+}
+
+/**
+ * Format a timestamp for chat display.
+ */
+function fmtTime(isoStr) {
+  try {
+    const d = new Date(isoStr);
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Sanitize text for HTML display (prevent XSS).
+ */
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+/**
+ * Render a single chat message in the chat panel.
+ */
+function renderChatMessage(msg) {
+  // Remove empty state
+  if (chatEmpty) chatEmpty.remove();
+
+  const el = document.createElement('div');
+
+  if (msg.isSystem) {
+    el.className = 'chat-msg chat-msg-system';
+    el.textContent = msg.text;
+  } else {
+    el.className = 'chat-msg';
+    const initial = (msg.displayName ?? '?')[0].toUpperCase();
+    const isMe = msg.userId === userId;
+    el.innerHTML = `
+      <div class="chat-avatar" aria-hidden="true">${initial}</div>
+      <div class="chat-body">
+        <span class="chat-author" style="${isMe ? 'color: var(--success);' : ''}">${escapeHtml(msg.displayName ?? 'Guest')}</span>
+        <span class="chat-time">${fmtTime(msg.timestamp)}</span>
+        <div class="chat-text">${escapeHtml(msg.text)}</div>
+      </div>
+    `;
+  }
+
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+/**
+ * Render an emoji reaction in the chat panel.
+ */
+function renderChatReaction(msg) {
+  if (chatEmpty) chatEmpty.remove();
+
+  const el = document.createElement('div');
+  el.className = 'chat-msg';
+  const initial = (msg.displayName ?? '?')[0].toUpperCase();
+  el.innerHTML = `
+    <div class="chat-avatar" aria-hidden="true">${initial}</div>
+    <div class="chat-body">
+      <span class="chat-author">${escapeHtml(msg.displayName ?? 'Guest')}</span>
+      <span class="chat-time">${fmtTime(msg.timestamp)}</span>
+      <div class="chat-reaction-bubble">${escapeHtml(msg.emoji)}</div>
+    </div>
+  `;
+  chatMessages.appendChild(el);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+/**
+ * Render chat history for late joiners (FR-10 + FR-03).
+ */
+function renderChatHistory(messages) {
+  if (!messages.length) return;
+  if (chatEmpty) chatEmpty.remove();
+
+  messages.forEach(msg => {
+    if (msg.type === 'CHAT_REACTION') {
+      renderChatReaction(msg);
+    } else {
+      renderChatMessage(msg);
+    }
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// FR-08: Display Name Change (mid-session)
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Change display name mid-session.
+ */
+function changeName() {
+  const newName = nameInput.value.trim();
+  if (!newName) { toast('Enter a display name.', 'error'); return; }
+  sendWs({ type: 'SET_NAME', displayName: newName });
+  sessionStorage.setItem('wp_displayName', newName);
+  toast(`Display name changed to "${newName}"`, 'success');
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -1130,6 +1281,8 @@ function handleSyncCheck(msg) {
 // ── Enter url with Enter key ──────────────────────────────────────────────
 urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') loadVideo(); });
 queueUrlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') addToQueue(); });
+chatInput?.addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
+nameInput?.addEventListener('keydown', e => { if (e.key === 'Enter') changeName(); });
 playerArea?.addEventListener('keydown', handlePlayerAreaKeydown);
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
@@ -1140,6 +1293,9 @@ playerArea?.addEventListener('keydown', handlePlayerAreaKeydown);
   if (role === 'guest') {
     emptyHint.textContent = 'Waiting for the host to load a video…';
   }
+  
+  // FR-08: Pre-fill display name input
+  if (nameInput) nameInput.value = displayName;
   
   // Ensure player area is focusable for keyboard controls
   playerArea?.setAttribute('tabindex', '0');

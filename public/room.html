@@ -431,6 +431,158 @@
       color: var(--text-muted);
     }
 
+    /* ── Chat Panel (FR-10) ── */
+    .chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .chat-msg {
+      display: flex;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: var(--radius-sm);
+      font-size: 0.82rem;
+      word-break: break-word;
+      animation: chatIn 200ms ease;
+    }
+    .chat-msg:hover {
+      background: rgba(255,255,255,0.03);
+    }
+    @keyframes chatIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .chat-msg-system {
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      font-style: italic;
+      padding: 4px 10px;
+    }
+    .chat-avatar {
+      width: 24px; height: 24px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), #c084fc);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem;
+      font-weight: 700;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .chat-body { flex: 1; min-width: 0; }
+    .chat-author {
+      font-weight: 600;
+      font-size: 0.78rem;
+      color: var(--accent-light);
+      margin-right: 6px;
+    }
+    .chat-time {
+      font-size: 0.65rem;
+      color: var(--text-muted);
+    }
+    .chat-text {
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .chat-reaction-bubble {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 12px;
+      border-radius: 100px;
+      background: rgba(108,99,255,0.1);
+      border: 1px solid rgba(108,99,255,0.2);
+      font-size: 1.4rem;
+      animation: reactionPop 400ms ease;
+    }
+    @keyframes reactionPop {
+      0%   { transform: scale(0); }
+      60%  { transform: scale(1.3); }
+      100% { transform: scale(1); }
+    }
+    .chat-input-area {
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .chat-input-row {
+      display: flex;
+      gap: 6px;
+    }
+    .chat-input-row .input {
+      flex: 1;
+      padding: 8px 12px;
+      font-size: 0.82rem;
+    }
+    .chat-send-btn {
+      padding: 8px 14px;
+      border-radius: var(--radius-md);
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.82rem;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background var(--t-fast), transform var(--t-fast);
+    }
+    .chat-send-btn:hover { background: var(--accent-light); transform: translateY(-1px); }
+    .chat-send-btn:active { transform: scale(0.95); }
+    .emoji-row {
+      display: flex;
+      gap: 2px;
+      flex-wrap: wrap;
+    }
+    .emoji-btn {
+      width: 32px; height: 32px;
+      border: none;
+      background: transparent;
+      border-radius: var(--radius-sm);
+      font-size: 1.1rem;
+      cursor: pointer;
+      transition: background var(--t-fast), transform var(--t-fast);
+      display: flex; align-items: center; justify-content: center;
+    }
+    .emoji-btn:hover { background: rgba(255,255,255,0.08); transform: scale(1.2); }
+    .emoji-btn:active { transform: scale(0.9); }
+    .chat-empty-msg {
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      padding: 24px 16px;
+    }
+
+    /* ── Display Name Edit (FR-08) ── */
+    .name-edit-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .name-edit-row .input {
+      flex: 1;
+      padding: 7px 10px;
+      font-size: 0.8rem;
+    }
+    .name-save-btn {
+      padding: 7px 12px;
+      border-radius: var(--radius-sm);
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.75rem;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background var(--t-fast);
+    }
+    .name-save-btn:hover { background: var(--accent-light); }
+
     /* ── Responsive ── */
     @media (max-width: 768px) {
       .room-layout {
@@ -485,6 +637,7 @@
       <!-- Sidebar Tabs -->
       <div class="sidebar-tabs" role="tablist" aria-label="Sidebar tabs">
         <button class="sidebar-tab active" id="stab-room" role="tab" aria-selected="true" aria-controls="spanel-room" onclick="switchSidebarTab('room')">👥 Room</button>
+        <button class="sidebar-tab" id="stab-chat" role="tab" aria-selected="false" aria-controls="spanel-chat" onclick="switchSidebarTab('chat')">💬 Chat</button>
         <button class="sidebar-tab" id="stab-queue" role="tab" aria-selected="false" aria-controls="spanel-queue" onclick="switchSidebarTab('queue')">📋 Queue</button>
       </div>
 
@@ -505,12 +658,44 @@
         </div>
         <div class="member-list" id="member-list" aria-live="polite" aria-label="Members list"></div>
 
+        <!-- Display Name Edit (FR-08) -->
+        <div class="sidebar-section">
+          <div class="sidebar-title">Your Display Name</div>
+          <div class="name-edit-row">
+            <input class="input" id="name-input" type="text" placeholder="Enter name…" maxlength="32" aria-label="Display name" />
+            <button class="name-save-btn" id="btn-save-name" onclick="changeName()">Save</button>
+          </div>
+        </div>
+
         <!-- Invite link -->
         <div class="invite-section">
           <div class="sidebar-title" style="margin-bottom:8px;">Invite Link</div>
           <div class="invite-row">
             <div class="invite-link-display" id="invite-display">—</div>
             <button class="btn btn-ghost" id="btn-copy" onclick="copyInvite()" style="padding:8px 12px;font-size:0.8rem;" aria-label="Copy invite link">Copy</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chat Panel (FR-10) -->
+      <div class="sidebar-panel" id="spanel-chat" role="tabpanel">
+        <div class="chat-messages" id="chat-messages" aria-live="polite" aria-label="Chat messages">
+          <div class="chat-empty-msg" id="chat-empty">No messages yet. Say hi! 👋</div>
+        </div>
+        <div class="chat-input-area">
+          <div class="emoji-row" id="emoji-row">
+            <button class="emoji-btn" onclick="sendReaction('😂')" aria-label="Laughing">😂</button>
+            <button class="emoji-btn" onclick="sendReaction('❤️')" aria-label="Heart">❤️</button>
+            <button class="emoji-btn" onclick="sendReaction('🔥')" aria-label="Fire">🔥</button>
+            <button class="emoji-btn" onclick="sendReaction('👏')" aria-label="Clap">👏</button>
+            <button class="emoji-btn" onclick="sendReaction('😮')" aria-label="Surprised">😮</button>
+            <button class="emoji-btn" onclick="sendReaction('😢')" aria-label="Sad">😢</button>
+            <button class="emoji-btn" onclick="sendReaction('🎉')" aria-label="Party">🎉</button>
+            <button class="emoji-btn" onclick="sendReaction('👀')" aria-label="Eyes">👀</button>
+          </div>
+          <div class="chat-input-row">
+            <input class="input" id="chat-input" type="text" placeholder="Type a message…" maxlength="500" aria-label="Chat message" />
+            <button class="chat-send-btn" id="btn-chat-send" onclick="sendChat()">Send</button>
           </div>
         </div>
       </div>

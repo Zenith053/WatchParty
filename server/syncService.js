@@ -7,6 +7,8 @@
  * FR-05 Vote-to-Watch:   QUEUE_ADD/UPVOTE/REMOVE → broadcast updated queue
  * FR-06 Skip Vote:       SKIP_VOTE → majority check → auto-play next from queue
  * FR-07 Host Migration:  host dropout → oldest guest promoted within 3 s (NFR-03)
+ * FR-08 Display Names:   SET_NAME → update display name mid-session
+ * FR-10 Live Chat:       CHAT_MSG/CHAT_REACTION → real-time text + emoji
  *
  * Message envelope (JSON):
  *   Client → Server:
@@ -21,6 +23,9 @@
  *     { type: 'QUEUE_REMOVE', queueId } — host only
  *     { type: 'SKIP_VOTE' }            — any member votes to skip
  *     { type: 'VIDEO_ENDED' }          — client signals video finished
+ *     { type: 'CHAT_MSG',    text }     — FR-10: send a chat message
+ *     { type: 'CHAT_REACTION', emoji }  — FR-10: send an emoji reaction
+ *     { type: 'SET_NAME',   displayName } — FR-08: change display name
  *
  *   Server → Client:
  *     { type: 'PLAY',         position }
@@ -32,6 +37,9 @@
  *     { type: 'MEMBER_LIST',   members }
  *     { type: 'QUEUE_UPDATE',  queue }    — full queue list broadcast
  *     { type: 'SKIP_STATUS',   count, needed } — skip vote progress
+ *     { type: 'CHAT_MSG',     userId, displayName, text, timestamp }
+ *     { type: 'CHAT_REACTION', userId, displayName, emoji, timestamp }
+ *     { type: 'CHAT_HISTORY', messages } — sent on JOIN for late joiners
  *     { type: 'ERROR',         message }
  */
 'use strict';
@@ -45,6 +53,10 @@ const {
 
 // roomId → Map<userId, { ws, role, joinedAt }>
 const rooms = new Map();
+
+// FR-10: Chat history per room (in-memory, capped at 200 messages)
+const chatHistory = new Map(); // roomId → [{ userId, displayName, text, emoji, type, timestamp }]
+const MAX_CHAT_HISTORY = 200;
 
 const HOST_MIGRATION_DELAY_MS = 2_500; // promote within 3 s (NFR-03)
 
@@ -214,6 +226,12 @@ function handleConnection(ws, _req) {
         send(ws, { type: 'QUEUE_UPDATE', queue });
       } catch { /* DB unavailable */ }
 
+      // FR-10: Send chat history to late joiner
+      const history = chatHistory.get(roomId);
+      if (history && history.length > 0) {
+        send(ws, { type: 'CHAT_HISTORY', messages: history });
+      }
+
       console.log(`[sync] ${userId} (${userRole}) joined room ${roomId}`);
       return;
     }
@@ -374,6 +392,89 @@ function handleConnection(ws, _req) {
       return;
     }
 
+    // ── CHAT_MSG (FR-10) — real-time text message ───────────────────────
+    if (msg.type === 'CHAT_MSG') {
+      const text = (msg.text ?? '').trim().slice(0, 500); // cap at 500 chars
+      if (!text) {
+        send(ws, { type: 'ERROR', message: 'Chat message cannot be empty' });
+        return;
+      }
+      const member = rooms.get(roomId)?.get(userId);
+      const chatMsg = {
+        type: 'CHAT_MSG',
+        userId,
+        displayName: member?.displayName ?? 'Guest',
+        text,
+        timestamp: new Date().toISOString(),
+      };
+      // Store in history
+      if (!chatHistory.has(roomId)) chatHistory.set(roomId, []);
+      const history = chatHistory.get(roomId);
+      history.push(chatMsg);
+      if (history.length > MAX_CHAT_HISTORY) history.shift();
+      // Broadcast to all room members
+      broadcast(roomId, chatMsg);
+      return;
+    }
+
+    // ── CHAT_REACTION (FR-10) — emoji reaction ──────────────────────────
+    if (msg.type === 'CHAT_REACTION') {
+      const emoji = (msg.emoji ?? '').trim().slice(0, 8); // single emoji
+      if (!emoji) {
+        send(ws, { type: 'ERROR', message: 'Emoji is required' });
+        return;
+      }
+      const member = rooms.get(roomId)?.get(userId);
+      const reactionMsg = {
+        type: 'CHAT_REACTION',
+        userId,
+        displayName: member?.displayName ?? 'Guest',
+        emoji,
+        timestamp: new Date().toISOString(),
+      };
+      // Store in history
+      if (!chatHistory.has(roomId)) chatHistory.set(roomId, []);
+      const history = chatHistory.get(roomId);
+      history.push(reactionMsg);
+      if (history.length > MAX_CHAT_HISTORY) history.shift();
+      // Broadcast to all
+      broadcast(roomId, reactionMsg);
+      return;
+    }
+
+    // ── SET_NAME (FR-08) — change display name mid-session ──────────────
+    if (msg.type === 'SET_NAME') {
+      const newName = (msg.displayName ?? '').trim().slice(0, 32);
+      if (!newName) {
+        send(ws, { type: 'ERROR', message: 'Display name cannot be empty' });
+        return;
+      }
+      const member = rooms.get(roomId)?.get(userId);
+      if (member) {
+        member.displayName = newName;
+        // Persist to DB
+        try {
+          const { query: dbQuery } = require('./db');
+          await dbQuery(
+            `UPDATE room_members SET display_name = $1 WHERE room_id = $2 AND user_id = $3`,
+            [newName, roomId, userId]
+          );
+        } catch { /* DB unavailable */ }
+        broadcastMemberList(roomId);
+        // Notify everyone about the name change
+        broadcast(roomId, {
+          type: 'CHAT_MSG',
+          userId: 'system',
+          displayName: 'System',
+          text: `${member.displayName} is now known as ${newName}`,
+          timestamp: new Date().toISOString(),
+          isSystem: true,
+        });
+        console.log(`[sync] ${userId} changed name to "${newName}" in room ${roomId}`);
+      }
+      return;
+    }
+
     // ── SYNC_CHECK (NEW) — guest reports drift, host can verify ──────────
     if (msg.type === 'SYNC_CHECK') {
       const guestPos = parseFloat(msg.position ?? 0);
@@ -401,6 +502,7 @@ function handleConnection(ws, _req) {
 
     if (members.size === 0) {
       rooms.delete(roomId);
+      chatHistory.delete(roomId); // FR-10: clean up chat history
       console.log(`[sync] Room ${roomId} empty — cleaned up`);
       return;
     }

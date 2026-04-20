@@ -4,6 +4,8 @@
  * Layer 1: In-memory Map  (µs reads, lives with process)
  * Layer 2: Redis hash      (persistence across restarts / crashes)
  *
+ * If Redis is unavailable, gracefully degrades to memory-only mode.
+ *
  * Snapshot shape: { url, position, status, updatedAt }
  *   url       – current video URL (normalised embed)
  *   position  – playback position in seconds (float)
@@ -12,20 +14,54 @@
  */
 'use strict';
 
-const Redis = require('ioredis');
-
-const redis = new Redis(process.env.WP_REDIS_URL || 'redis://localhost:6379', {
-  lazyConnect: true,
-  maxRetriesPerRequest: 2,
-  enableOfflineQueue: false,
-});
-
-redis.on('error', (err) => {
-  console.error('[stateStore] Redis error (falling back to memory):', err.message);
-});
-
-// In-memory layer
+// In-memory layer (always available)
 const memStore = new Map(); // roomId → snapshot object
+
+// Redis layer (optional)
+let redis = null;
+let redisAvailable = false;
+
+try {
+  const Redis = require('ioredis');
+  redis = new Redis(process.env.WP_REDIS_URL || 'redis://localhost:6379', {
+    lazyConnect: true,
+    maxRetriesPerRequest: 1,
+    retryStrategy(times) {
+      if (times > 2) {
+        console.warn('[stateStore] Redis unavailable — running memory-only mode');
+        redisAvailable = false;
+        return null; // stop retrying
+      }
+      return Math.min(times * 200, 1000);
+    },
+    enableOfflineQueue: false,
+    connectTimeout: 3000,
+  });
+
+  redis.on('connect', () => {
+    redisAvailable = true;
+    console.log('[stateStore] Redis connected');
+  });
+
+  redis.on('error', (err) => {
+    if (redisAvailable) {
+      console.warn('[stateStore] Redis error (falling back to memory):', err.message);
+    }
+    redisAvailable = false;
+  });
+
+  redis.on('close', () => {
+    redisAvailable = false;
+  });
+
+  // Attempt connection but don't block startup
+  redis.connect().catch(() => {
+    console.warn('[stateStore] Redis not available — using memory-only mode');
+    redisAvailable = false;
+  });
+} catch {
+  console.warn('[stateStore] ioredis not available — using memory-only mode');
+}
 
 const REDIS_KEY = (roomId) => `room:${roomId}:state`;
 const REDIS_TTL = 86_400; // 24 h — mirrors NFR-06 token expiry
@@ -40,11 +76,13 @@ async function setState(roomId, snapshot) {
   const next = { ...existing, ...snapshot, updatedAt: new Date().toISOString() };
   memStore.set(roomId, next);
 
-  try {
-    await redis.hset(REDIS_KEY(roomId), next);
-    await redis.expire(REDIS_KEY(roomId), REDIS_TTL);
-  } catch {
-    // Redis unavailable — memory-only is degraded but functional
+  if (redisAvailable && redis) {
+    try {
+      await redis.hset(REDIS_KEY(roomId), next);
+      await redis.expire(REDIS_KEY(roomId), REDIS_TTL);
+    } catch {
+      // Redis unavailable — memory-only is degraded but functional
+    }
   }
 }
 
@@ -57,21 +95,23 @@ async function getState(roomId) {
   const mem = memStore.get(roomId);
   if (mem) return mem;
 
-  try {
-    const raw = await redis.hgetall(REDIS_KEY(roomId));
-    if (raw && raw.url) {
-      // Rehydrate memory from Redis
-      const snap = {
-        url: raw.url,
-        position: parseFloat(raw.position ?? 0),
-        status: raw.status ?? 'paused',
-        updatedAt: raw.updatedAt,
-      };
-      memStore.set(roomId, snap);
-      return snap;
+  if (redisAvailable && redis) {
+    try {
+      const raw = await redis.hgetall(REDIS_KEY(roomId));
+      if (raw && raw.url) {
+        // Rehydrate memory from Redis
+        const snap = {
+          url: raw.url,
+          position: parseFloat(raw.position ?? 0),
+          status: raw.status ?? 'paused',
+          updatedAt: raw.updatedAt,
+        };
+        memStore.set(roomId, snap);
+        return snap;
+      }
+    } catch {
+      // Redis unavailable
     }
-  } catch {
-    // Redis unavailable
   }
   return null;
 }
@@ -81,10 +121,12 @@ async function getState(roomId) {
  */
 async function deleteState(roomId) {
   memStore.delete(roomId);
-  try {
-    await redis.del(REDIS_KEY(roomId));
-  } catch {
-    // ignore
+  if (redisAvailable && redis) {
+    try {
+      await redis.del(REDIS_KEY(roomId));
+    } catch {
+      // ignore
+    }
   }
 }
 
