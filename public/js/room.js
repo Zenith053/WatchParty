@@ -32,6 +32,8 @@ const memberList     = $('member-list');
 const memberCount    = $('member-count');
 const emptyState     = $('empty-state');
 const emptyHint      = $('empty-state-hint');
+const playerArea     = $('player-area');
+const videoShell     = $('video-shell');
 const videoFrame     = $('video-frame');
 const guestOverlay   = $('guest-overlay');
 const urlSection     = $('url-section');
@@ -88,6 +90,11 @@ function applyRoleUI() {
   hostControls.classList.toggle('hidden', !isHost);
   hostSeek.classList.toggle('hidden', !isHost);
   guestMsg.classList.toggle('hidden',  isHost);
+  updateGuestOverlay();
+}
+
+function updateGuestOverlay() {
+  const isHost = role === 'host' || role === 'co-host';
   guestOverlay.classList.toggle('hidden', isHost);
 }
 
@@ -102,7 +109,8 @@ function showCatchupFlash() {
   const el = document.createElement('div');
   el.className = 'catchup-flash';
   el.textContent = '⏩ Caught up to live position';
-  $('player-area') ?? document.querySelector('.player-area').appendChild(el);
+  const playerArea = document.querySelector('.player-area');
+  playerArea?.appendChild(el);
   el.addEventListener('animationend', () => el.remove(), { once: true });
 }
 
@@ -118,33 +126,511 @@ function fmt(s) {
 // ══════════════════════════════════════════════════════════════════════════
 let ytPlayer       = null;
 let ytReady        = false;
-let pendingCatchup = null;   // { position, status } received before player ready
 let seekPending    = false;  // user is actively dragging
 let poller         = null;   // seek-bar update interval
+let syncVerificationTimer = null;  // verify guest sync (NEW)
+let endedReportedForCurrentVideo = false;
+let playerReady    = false;
+let playerVideoReady = false;
+let playerSeekable = false;  // can actually seek (NEW)
+let activeVideoId  = null;
+let pendingVideoId = null;
+let pendingPlayerState = null;
+let pendingCatchupFlash = false;
+let pendingRetryTimer = null;  // retry backoff timer (NEW)
+let pendingRetryCount = 0;     // retry attempt counter (NEW)
+const MAX_RETRIES = 5;         // max retry attempts (NEW)
+let lastCommandType = null;    // last broadcast command type (NEW)
+let commandSuppressUntil = 0;  // suppress window based on command (NEW)
+let lastPolledPosition = 0;
+let lastPollTs = 0;
+let lastBroadcastSeekAt = 0;
+let lastIdleCheckAt = 0;       // track idle for periodic sync (NEW)
+let lastServerSync = 0;        // track last full server sync (NEW)
+let lastKnownServerSequence = 0;  // track command sequence for verification (NEW)
+const KEYBOARD_SEEK_STEP_SECONDS = 5;
+const DRIFT_THRESHOLD_SMALL = 0.5;  // small drift always broadcasts (NEW)
+const DRIFT_THRESHOLD_LARGE = 1.5;  // large drift broadcasts (NEW)
+const SUPPRESS_WINDOW_SHORT = 400;  // short suppress for same command (NEW)
+const SYNC_VERIFY_INTERVAL = 10000;  // verify sync every 10s (NEW)
+const ALLOWED_SYNC_DRIFT = 0.5;  // max allowed drift before resync (NEW)
 
 // Called by YouTube IFrame API when script loads
-window.onYouTubeIframeAPIReady = () => { ytReady = true; };
+window.onYouTubeIframeAPIReady = () => {
+  ytReady = true;
+  maybeLoadPendingVideo();
+};
 
-function createPlayer(embedUrl) {
+function extractYouTubeVideoId(rawUrl) {
+  if (!rawUrl) return null;
+
+  if (/^[a-zA-Z0-9_-]{11}$/.test(rawUrl)) {
+    return rawUrl;
+  }
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.hostname === 'youtu.be') {
+      return url.pathname.slice(1) || null;
+    }
+
+    if (url.searchParams.get('v')) {
+      return url.searchParams.get('v');
+    }
+
+    const parts = url.pathname.split('/').filter(Boolean);
+    const embedIndex = parts.indexOf('embed');
+    if (embedIndex !== -1 && parts[embedIndex + 1]) {
+      return parts[embedIndex + 1];
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+function syncPlayerSnapshot() {
+  if (!ytPlayer || !playerReady) return;
+
+  try {
+    const currentTime = ytPlayer.getCurrentTime();
+    const duration = ytPlayer.getDuration();
+
+    if (Number.isFinite(currentTime) && currentTime >= 0) {
+      localPosition = currentTime;
+    }
+    if (Number.isFinite(duration) && duration > 0) {
+      localDuration = duration;
+    }
+  } catch {
+    return;
+  }
+
+  updateSeekBar();
+  updateTimestamp();
+}
+
+function getPlayerTime() {
+  if (!ytPlayer || !playerReady) {
+    console.warn("[PlayerTime] Fallback → player not ready", {
+      ytPlayer: !!ytPlayer,
+      playerReady,
+      localPosition
+    });
+    return localPosition;
+  }
+
+  try {
+    const currentTime = ytPlayer.getCurrentTime();
+
+    if (Number.isFinite(currentTime) && currentTime >= 0) {
+      return currentTime;
+    }
+
+    console.warn("[PlayerTime] Fallback → invalid time from player", {
+      currentTime,
+      localPosition
+    });
+    return localPosition;
+
+  } catch (err) {
+    console.warn("[PlayerTime] Fallback → exception", {
+      error: err,
+      localPosition
+    });
+    return localPosition;
+  }
+}
+
+function getPlayerDuration() {
+  if (!ytPlayer || !playerReady) {
+    console.warn("[PlayerDuration] Fallback → player not ready", {
+      ytPlayer: !!ytPlayer,
+      playerReady,
+      localDuration
+    });
+    return localDuration;
+  }
+
+  try {
+    const duration = ytPlayer.getDuration();
+
+    if (Number.isFinite(duration) && duration > 0) {
+      return duration;
+    }
+
+    console.warn("[PlayerDuration] Fallback → invalid duration", {
+      duration,
+      localDuration
+    });
+    return localDuration;
+
+  } catch (err) {
+    console.warn("[PlayerDuration] Fallback → exception", {
+      error: err,
+      localDuration
+    });
+    return localDuration;
+  }
+}
+
+function isHostController() {
+  return role === 'host' || role === 'co-host';
+}
+
+function shouldBroadcastHostControl() {
+  return isHostController() &&
+    ws?.readyState === WebSocket.OPEN &&
+    Date.now() > suppressHostBroadcastUntil;
+}
+
+function suppressHostBroadcast(ms = SUPPRESS_WINDOW_SHORT) {
+  commandSuppressUntil = Math.max(commandSuppressUntil, Date.now() + ms);
+}
+
+function shouldSuppressBroadcast(commandType) {
+  // Only suppress if same command type within suppress window
+  return lastCommandType === commandType && Date.now() < commandSuppressUntil;
+}
+
+function broadcastHostPlayback(type, position = getPlayerTime()) {
+  if (!shouldBroadcastHostControl()) return false;
+  lastCommandType = type;
+  commandSuppressUntil = Date.now() + SUPPRESS_WINDOW_SHORT;
+  logSync(`[BROADCAST] type=${type} position=${position.toFixed(1)}s`);
+  return sendWs({ type, position });
+}
+
+function canApplyPlayerState() {
+  return ytPlayer && playerReady && playerVideoReady && playerSeekable;
+}
+
+function flushPendingPlayerState() {
+  if (!pendingPlayerState) return;
+  if (!canApplyPlayerState()) {
+    // Schedule retry with exponential backoff
+    if (!pendingRetryTimer) {
+      const delay = Math.pow(2, pendingRetryCount) * 100; // 100ms, 200ms, 400ms...
+      if (pendingRetryCount < MAX_RETRIES) {
+        logSync(`[RETRY] Scheduling retry ${pendingRetryCount + 1}/${MAX_RETRIES} in ${delay}ms`);
+        pendingRetryCount++;
+        pendingRetryTimer = setTimeout(() => {
+          pendingRetryTimer = null;
+          flushPendingPlayerState();
+        }, delay);
+      } else {
+        logSync(`[ERROR] Max retries reached for state:`, pendingPlayerState);
+        pendingPlayerState = null;
+        pendingRetryCount = 0;
+      }
+    }
+    return;
+  }
+
+  const nextState = pendingPlayerState;
+  pendingPlayerState = null;
+  pendingRetryCount = 0;
+  if (pendingRetryTimer) {
+    clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = null;
+  }
+
+  try {
+    if (typeof nextState.position === 'number' && Number.isFinite(nextState.position)) {
+      const pos = Math.max(0, Math.min(nextState.position, localDuration));
+      logSync(`[SEEK-APPLY] Seeking to ${pos.toFixed(1)}s`);
+      ytPlayer.seekTo(pos, true);
+      localPosition = pos;
+    }
+
+    if (nextState.status === 'playing') {
+      logSync(`[PLAY-APPLY]`);
+      ytPlayer.playVideo();
+    } else if (nextState.status === 'paused') {
+      logSync(`[PAUSE-APPLY]`);
+      ytPlayer.pauseVideo();
+    }
+  } catch (err) {
+    logSync(`[ERROR] Failed to apply state:`, err.message);
+    pendingPlayerState = nextState;
+    return;
+  }
+
+  suppressHostBroadcast();
+  syncPlayerSnapshot();
+
+  if (pendingCatchupFlash) {
+    pendingCatchupFlash = false;
+    showCatchupFlash();
+  }
+}
+
+function queuePlayerState(nextState, options = {}) {
+  pendingPlayerState = { ...(pendingPlayerState ?? {}), ...nextState };
+  if (options.showCatchupFlash) {
+    pendingCatchupFlash = true;
+  }
+  flushPendingPlayerState();
+}
+
+function handlePlayerReady(event) {
+  playerReady = true;
+  playerVideoReady = true;
+  playerSeekable = true;  // Player is ready to seek
+  pendingVideoId = null;
+  const iframe = videoFrame?.querySelector('iframe');
+  iframe?.setAttribute('tabindex', '-1');
+  logSync(`[PLAYER-READY]`);
+  startSeekPoller();
+  syncPlayerSnapshot();
+  lastPolledPosition = getPlayerTime();
+  lastPollTs = Date.now();
+  lastIdleCheckAt = Date.now();
+  flushPendingPlayerState();
+
+  // Give player a moment to stabilize before applying pending state
+  setTimeout(() => {
+    if (pendingPlayerState) {
+      logSync(`[DEFERRED-FLUSH] Applying deferred state after stabilization`);
+      flushPendingPlayerState();
+    }
+  }, 100);
+
+  // If a newer load request arrived while the API was initialising, honour it now.
+  if (activeVideoId && extractYouTubeVideoId(event.target.getVideoUrl?.() ?? '') !== activeVideoId) {
+    pendingVideoId = activeVideoId;
+    playerVideoReady = false;
+    playerSeekable = false;
+    maybeLoadPendingVideo();
+  }
+}
+
+function handlePlayerStateChange(event) {
+  const state = event.data;
+  const prevStatus = localStatus;
+  const stateNames = {
+    [-1]: 'UNSTARTED',
+    [0]: 'ENDED',
+    [1]: 'PLAYING',
+    [2]: 'PAUSED',
+    [3]: 'BUFFERING',
+    [5]: 'CUED'
+  };
+
+  logSync(`[STATE-CHANGE] ${stateNames[state] || state}`);
+
+  if (state === YT.PlayerState.CUED ||
+      state === YT.PlayerState.PLAYING ||
+      state === YT.PlayerState.PAUSED ||
+      state === YT.PlayerState.BUFFERING) {
+    playerVideoReady = true;
+    playerSeekable = true;
+    syncPlayerSnapshot();
+    flushPendingPlayerState();
+  }
+
+  if (state === YT.PlayerState.PLAYING) {
+    localStatus = 'playing';
+    endedReportedForCurrentVideo = false;
+    btnPlayPause.textContent = '⏸';
+  } else if (state === YT.PlayerState.PAUSED || state === YT.PlayerState.CUED) {
+    if (localStatus !== 'ended') {
+      localStatus = 'paused';
+    }
+    btnPlayPause.textContent = '▶';
+  } else if (state === YT.PlayerState.ENDED) {
+    localStatus = 'ended';
+    btnPlayPause.textContent = '▶';
+
+    if (!endedReportedForCurrentVideo) {
+      endedReportedForCurrentVideo = true;
+      logSync(`[VIDEO-ENDED]`);
+      onVideoEnded();
+    }
+  }
+
+  syncPlayerSnapshot();
+
+  if (state === YT.PlayerState.PLAYING && prevStatus !== 'playing') {
+    logSync(`[PLAY-DETECTED] Broadcasting play`);
+    broadcastHostPlayback('PLAY');
+  } else if (state === YT.PlayerState.PAUSED && prevStatus === 'playing') {
+    logSync(`[PAUSE-DETECTED] Broadcasting pause`);
+    broadcastHostPlayback('PAUSE');
+  }
+}
+
+function handlePlayerError(event) {
+  console.error('[room.js] YT player error', event.data);
+  toast('Could not load this YouTube video.', 'error');
+}
+
+function maybeLoadPendingVideo() {
+  if (!ytReady || !pendingVideoId) return;
+
+  if (!ytPlayer) {
+    activeVideoId = pendingVideoId;
+    logSync(`[INIT-PLAYER] Creating YouTube player for ${activeVideoId}`);
+    ytPlayer = new window.YT.Player('video-frame', {
+      width: '100%',
+      height: '100%',
+      videoId: activeVideoId,
+      host: 'https://www.youtube-nocookie.com',
+      playerVars: {
+        rel: 0,
+        controls: 0,
+        disablekb: 1,
+        modestbranding: 1,
+        playsinline: 1,
+        origin: location.origin,
+      },
+      events: {
+        onReady: handlePlayerReady,
+        onStateChange: handlePlayerStateChange,
+        onError: handlePlayerError,
+      },
+    });
+    return;
+  }
+
+  if (!playerReady) return;
+
+  activeVideoId = pendingVideoId;
+  pendingVideoId = null;
+  playerVideoReady = false;
+  playerSeekable = false;
+  logSync(`[CUE-VIDEO] Cueing ${activeVideoId}`);
+
+  try {
+    ytPlayer.cueVideoById({
+      videoId: activeVideoId,
+      startSeconds: 0,
+    });
+  } catch (err) {
+    logSync(`[ERROR] Failed to cue video: ${err.message}`);
+  }
+}
+
+function createPlayer(videoUrl) {
+  const videoId = extractYouTubeVideoId(videoUrl);
+  if (!videoId) {
+    toast('Only YouTube videos are supported right now.', 'error');
+    return false;
+  }
+
+  logSync(`[CREATE-PLAYER] Loading video ${videoId}`);
   emptyState.classList.add('hidden');
-  videoFrame.classList.remove('hidden');
-  videoFrame.src = embedUrl;
+  videoShell.classList.remove('hidden');
+  endedReportedForCurrentVideo = false;
+  playerVideoReady = false;
+  playerSeekable = false;
+  pendingVideoId = videoId;
+  activeVideoId = videoId;
+  lastPolledPosition = 0;
+  lastPollTs = Date.now();
+  lastBroadcastSeekAt = 0;
+  lastIdleCheckAt = Date.now();
+  lastServerSync = 0;
 
   // Destroy existing polling
   if (poller) clearInterval(poller);
-
-  // Start polling for seek bar + time display (host only)
-  if (role === 'host' || role === 'co-host') {
-    startSeekPoller();
+  if (pendingRetryTimer) {
+    clearTimeout(pendingRetryTimer);
+    pendingRetryTimer = null;
   }
+  if (syncVerificationTimer) {
+    clearInterval(syncVerificationTimer);
+    syncVerificationTimer = null;
+  }
+
+  maybeLoadPendingVideo();
+  startSeekPoller();
+  startSyncVerification();  // Start verifying guest sync
+  
+  // Focus player for keyboard input with retries
+  setTimeout(() => {
+    videoShell?.focus();
+    playerArea?.focus();
+    logSync(`[FOCUS-INIT] Set focus to video elements`);
+  }, 100);
+  
+  // Create click blocker overlay for hosts
+  createClickBlocker();
+  
+  return true;
+}
+
+function createClickBlocker() {
+  if (!isHostController()) return;
+  
+  // Create transparent overlay to block YouTube's click pause/play
+  let blocker = document.getElementById('video-click-blocker');
+  if (blocker) blocker.remove();
+  
+  blocker = document.createElement('div');
+  blocker.id = 'video-click-blocker';
+  blocker.style.cssText = `
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: transparent;
+    z-index: 1;
+    pointer-events: auto;
+    cursor: default;
+  `;
+  
+  // Prevent default click actions
+  blocker.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    logSync(`[CLICK-BLOCKED] Click intercepted on video`);
+  }, true);
+  
+  blocker.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    logSync(`[DBLCLICK-BLOCKED] Double-click intercepted`);
+  }, true);
+  
+  videoShell?.appendChild(blocker);
+  logSync(`[CLICK-BLOCKER] Created for host`);
 }
 
 function startSeekPoller() {
   if (poller) clearInterval(poller);
   poller = setInterval(() => {
-    if (!videoFrame.src || seekPending) return;
-    // We can't read YT iframe state cross-origin without the API object.
-    // room.js tracks position locally via the server's state messages.
+    if (!ytPlayer || !playerReady || !playerVideoReady || seekPending) return;
+    syncPlayerSnapshot();
+
+    const now = Date.now();
+    const current = getPlayerTime();
+    const elapsedSec = lastPollTs ? (now - lastPollTs) / 1000 : 0;
+    const expected = localStatus === 'playing'
+      ? lastPolledPosition + elapsedSec
+      : lastPolledPosition;
+    const drift = Math.abs(current - expected);
+
+    // Broadcast if:
+    // 1. Large drift detected AND not suppressing same command
+    // 2. Small drift always broadcasts if not suppressing
+    // 3. Idle threshold: no command in 5s, send position update
+    const isSuppressed = shouldSuppressBroadcast('SEEK');
+    const timeSinceLastBroadcast = now - lastBroadcastSeekAt;
+    const isIdleUpdate = now - lastIdleCheckAt > 5000;
+
+    if (shouldBroadcastHostControl()) {
+      if ((drift > DRIFT_THRESHOLD_LARGE && !isSuppressed && timeSinceLastBroadcast > 400) ||
+          (drift > DRIFT_THRESHOLD_SMALL && timeSinceLastBroadcast > 1000) ||
+          (isIdleUpdate && localStatus === 'playing')) {
+        lastBroadcastSeekAt = now;
+        lastIdleCheckAt = now;
+        logSync(`[DRIFT] ${drift.toFixed(1)}s, broadcasting SEEK`);
+        broadcastHostPlayback('SEEK', current);
+      }
+    }
+
+    lastPolledPosition = current;
+    lastPollTs = now;
   }, 500);
 }
 
@@ -154,39 +640,6 @@ function startSeekPoller() {
 let localPosition  = 0;
 let localStatus    = 'paused';
 let localDuration  = 0;  // set once known
-
-// We use the YouTube postMessage API to control the embed
-function ytPostMessage(event, args = []) {
-  if (!videoFrame.contentWindow) return;
-  videoFrame.contentWindow.postMessage(
-    JSON.stringify({ event, func: event, args }),
-    '*'
-  );
-}
-
-function ytPlay()        { ytPostMessage('playVideo'); }
-function ytPause()       { ytPostMessage('pauseVideo'); }
-function ytSeekTo(s)     { ytPostMessage('seekTo', [s, true]); }
-
-// Listen for messages back from the YouTube embed
-window.addEventListener('message', (ev) => {
-  try {
-    const data = JSON.parse(ev.data);
-    // YT sends info events with currentTime
-    if (data.info?.currentTime !== undefined) {
-      localPosition = data.info.currentTime;
-    }
-    if (data.info?.duration) {
-      localDuration = data.info.duration;
-    }
-    // Detect video ended (playerState 0)
-    if (data.info?.playerState === 0) {
-      onVideoEnded();
-    }
-    updateSeekBar();
-    updateTimestamp();
-  } catch { /* non-JSON message from another source */ }
-});
 
 function updateSeekBar() {
   if (seekPending || !localDuration) return;
@@ -206,7 +659,7 @@ function updateTimestamp() {
  */
 function onVideoEnded() {
   if (role === 'host' || role === 'co-host') {
-    ws.send(JSON.stringify({ type: 'VIDEO_ENDED' }));
+    sendWs({ type: 'VIDEO_ENDED' });
   }
 }
 
@@ -218,21 +671,41 @@ let ws;
 let reconnectAttempts = 0;
 const MAX_RECONNECT   = 5;
 
+function logSync(...args) {
+  console.info('[room.js]', ...args);
+}
+
+function sendWs(message) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    console.warn('[room.js] WS send skipped; socket not open yet', message);
+    toast('Connection is still starting. Try again in a moment.', 'warn', 2500);
+    return false;
+  }
+
+  ws.send(JSON.stringify(message));
+  logSync('sent', message);
+  return true;
+}
+
 function connect() {
+  logSync('connecting to', WS_URL);
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener('open', () => {
     reconnectAttempts = 0;
-    ws.send(JSON.stringify({ type: 'JOIN', roomId, userId, role, displayName }));
+    logSync('socket open');
+    sendWs({ type: 'JOIN', roomId, userId, role, displayName });
   });
 
   ws.addEventListener('message', ({ data }) => {
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
+    logSync('received', msg);
     handleMessage(msg);
   });
 
   ws.addEventListener('close', () => {
+    logSync('socket closed');
     if (reconnectAttempts < MAX_RECONNECT) {
       reconnectAttempts++;
       const delay = Math.min(500 * 2 ** reconnectAttempts, 10_000);
@@ -250,56 +723,64 @@ function connect() {
 
 // ── Incoming message handler ──────────────────────────────────────────────
 function handleMessage(msg) {
+  logSync(`[RCV-${msg.type}]`, msg);
+  
   switch (msg.type) {
 
     // FR-03: Late-join catch-up
     case 'CATCHUP':
+      logSync(`[CATCHUP] position=${msg.position}, status=${msg.status}`);
       localPosition = msg.position ?? 0;
       localStatus   = msg.status   ?? 'paused';
       if (msg.url) {
-        createPlayer(msg.url);
-        setTimeout(() => {
-          ytSeekTo(localPosition);
-          if (localStatus === 'playing') ytPlay();
-          showCatchupFlash();
-        }, 1500); // give iframe time to load
+        if (createPlayer(msg.url)) {
+          queuePlayerState(
+            { position: localPosition, status: localStatus },
+            { showCatchupFlash: true }
+          );
+        }
       }
       updateSeekBar();
       break;
 
     // FR-02: Playback sync
     case 'PLAY':
+      logSync(`[PLAY] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
       localStatus   = 'playing';
-      ytSeekTo(localPosition);
-      ytPlay();
+      queuePlayerState({ position: localPosition, status: 'playing' });
       btnPlayPause.textContent = '⏸';
       break;
 
     case 'PAUSE':
+      logSync(`[PAUSE] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
       localStatus   = 'paused';
-      ytSeekTo(localPosition);
-      ytPause();
+      queuePlayerState({ position: localPosition, status: 'paused' });
       btnPlayPause.textContent = '▶';
       break;
 
     case 'SEEK':
+      logSync(`[SEEK] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
-      ytSeekTo(localPosition);
+      queuePlayerState({ position: localPosition });
       updateSeekBar();
       break;
 
     // New video loaded by host
     case 'LOAD':
-      createPlayer(msg.url);
+      logSync(`[LOAD] url=${msg.url}`);
+      if (!createPlayer(msg.url)) break;
       localPosition = 0;
       localStatus   = 'paused';
+      endedReportedForCurrentVideo = false;
+      queuePlayerState({ position: 0, status: 'paused' });
       updateSeekBar();
       break;
 
     // FR-07: This client is promoted to host
     case 'HOST_PROMOTED':
+      logSync(`[HOST-PROMOTED] userId=${msg.userId}`);
       if (msg.userId === userId) {
         role = msg.role ?? 'host';
         applyRoleUI();
@@ -328,10 +809,16 @@ function handleMessage(msg) {
       break;
 
     case 'ERROR':
+      logSync(`[ERROR-MSG] ${msg.message}`);
       toast(msg.message, 'error');
       break;
+    
+    // Sync verification from guests (host only)
+    case 'SYNC_CHECK':
+      handleSyncCheck(msg);
+      break;
   }
-}
+ }
 
 // ── Member list rendering ─────────────────────────────────────────────────
 function renderMembers(members) {
@@ -424,7 +911,7 @@ function extractVideoLabel(url) {
 function addToQueue() {
   const url = queueUrlInput.value.trim();
   if (!url) { toast('Enter a YouTube URL to nominate.', 'error'); return; }
-  ws.send(JSON.stringify({ type: 'QUEUE_ADD', url }));
+  sendWs({ type: 'QUEUE_ADD', url });
   queueUrlInput.value = '';
   toast('Video added to queue!', 'success');
 }
@@ -433,14 +920,14 @@ function addToQueue() {
  * Upvote a queue entry (FR-05).
  */
 function upvoteQueue(queueId) {
-  ws.send(JSON.stringify({ type: 'QUEUE_UPVOTE', queueId }));
+  sendWs({ type: 'QUEUE_UPVOTE', queueId });
 }
 
 /**
  * Remove a queue entry — host only (FR-05).
  */
 function removeFromQueue(queueId) {
-  ws.send(JSON.stringify({ type: 'QUEUE_REMOVE', queueId }));
+  sendWs({ type: 'QUEUE_REMOVE', queueId });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -451,7 +938,7 @@ function removeFromQueue(queueId) {
  * Vote to skip the current video (FR-06).
  */
 function voteSkip() {
-  ws.send(JSON.stringify({ type: 'SKIP_VOTE' }));
+  sendWs({ type: 'SKIP_VOTE' });
 }
 
 /**
@@ -466,32 +953,112 @@ function updateSkipProgress(count, needed) {
 // ══════════════════════════════════════════════════════════════════════════
 
 function togglePlay() {
+  syncPlayerSnapshot();
   if (localStatus === 'playing') {
-    ws.send(JSON.stringify({ type: 'PAUSE', position: localPosition }));
+    logSync(`[PLAY-BTN] Pausing video at ${getPlayerTime().toFixed(1)}s`);
+    sendWs({ type: 'PAUSE', position: getPlayerTime() });
   } else {
-    ws.send(JSON.stringify({ type: 'PLAY',  position: localPosition }));
+    logSync(`[PLAY-BTN] Playing video from ${getPlayerTime().toFixed(1)}s`);
+    sendWs({ type: 'PLAY', position: getPlayerTime() });
   }
 }
 
 // Seek bar: local visual update while dragging
 function onSeekInput(value) {
   seekPending = true;
-  const s = (parseFloat(value) / 100) * (localDuration || 1);
+  const duration = getPlayerDuration();
+  const s = duration ? (parseFloat(value) / 100) * duration : 0;
   timeCurrent.textContent = fmt(s);
 }
 
 // Seek bar: committed → broadcast SEEK
 function onSeekCommit(value) {
+  const duration = getPlayerDuration();
+  if (!duration) {
+    seekPending = false;
+    toast('Video timing is not ready yet. Try again in a moment.', 'warn');
+    return;
+  }
+
   seekPending   = false;
-  localPosition = (parseFloat(value) / 100) * (localDuration || 1);
-  ws.send(JSON.stringify({ type: 'SEEK', position: localPosition }));
+  localPosition = (parseFloat(value) / 100) * duration;
+  updateSeekBar();
+  logSync(`[SEEK-COMMIT] Seeking to ${localPosition.toFixed(1)}s via seek bar`);
+  sendWs({ type: 'SEEK', position: localPosition });
 }
+
+function commitKeyboardSeek(nextPosition) {
+  const duration = getPlayerDuration();
+  if (!duration) return false;
+
+  seekPending = false;
+  localPosition = Math.max(0, Math.min(nextPosition, duration));
+  updateSeekBar();
+  logSync(`[SEEK-KEYBOARD] Arrow key seek to ${localPosition.toFixed(1)}s`);
+  sendWs({ type: 'SEEK', position: localPosition });
+  return true;
+}
+
+function handlePlayerAreaKeydown(event) {
+  if (!isHostController() || videoShell.classList.contains('hidden')) return;
+
+  let nextPosition = null;
+  let keyName = '';
+  let handled = false;
+
+  if (event.key === 'ArrowLeft') {
+    nextPosition = getPlayerTime() - KEYBOARD_SEEK_STEP_SECONDS;
+    keyName = 'ArrowLeft';
+    handled = true;
+  } else if (event.key === 'ArrowRight') {
+    nextPosition = getPlayerTime() + KEYBOARD_SEEK_STEP_SECONDS;
+    keyName = 'ArrowRight';
+    handled = true;
+  } else if (event.key === 'Home') {
+    nextPosition = 0;
+    keyName = 'Home';
+    handled = true;
+  } else if (event.key === 'End') {
+    nextPosition = getPlayerDuration();
+    keyName = 'End';
+    handled = true;
+  }
+
+  if (!handled) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+  logSync(`[KEY-${keyName}] Current: ${getPlayerTime().toFixed(1)}s → Next: ${nextPosition.toFixed(1)}s`);
+  commitKeyboardSeek(nextPosition);
+}
+
+// Global keyboard handler as fallback for arrow keys
+document.addEventListener('keydown', (event) => {
+  if (!isHostController() || videoShell?.classList.contains('hidden')) return;
+  
+  // Only handle if video player has focus or player area has focus
+  const isFocused = document.activeElement === videoShell || 
+                    document.activeElement === playerArea ||
+                    document.activeElement === document.body;
+  
+  if (!isFocused && !videoShell?.contains(document.activeElement)) return;
+  
+  if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+    // Dispatch to the normal handler
+    const customEvent = new KeyboardEvent('keydown', {
+      key: event.key,
+      code: event.code,
+      bubbles: true,
+    });
+    playerArea?.dispatchEvent(customEvent);
+  }
+}, true);
 
 // Load URL (host panel)
 function loadVideo() {
   const url = urlInput.value.trim();
   if (!url) { toast('Enter a YouTube URL first.', 'error'); return; }
-  ws.send(JSON.stringify({ type: 'LOAD', url }));
+  sendWs({ type: 'LOAD', url });
   urlInput.value = '';
 }
 
@@ -504,21 +1071,81 @@ function copyInvite() {
 
 // Leave room
 function leaveRoom() {
+  logSync(`[LEAVING-ROOM]`);
   if (ws) ws.close();
+  if (poller) clearInterval(poller);
+  if (pendingRetryTimer) clearTimeout(pendingRetryTimer);
+  if (syncVerificationTimer) clearInterval(syncVerificationTimer);
+  if (ytPlayer?.destroy) ytPlayer.destroy();
   sessionStorage.clear();
   location.replace('/');
+}
+
+// ── Sync Verification (NEW) ────────────────────────────────────────────────
+function startSyncVerification() {
+  if (isHostController()) return; // Only guests verify
+  
+  if (syncVerificationTimer) clearInterval(syncVerificationTimer);
+  
+  syncVerificationTimer = setInterval(() => {
+    if (videoShell.classList.contains('hidden') || !playerReady) return;
+    
+    // Verify we're at expected position
+    const actualPos = getPlayerTime();
+    const expectedPos = localPosition;
+    const drift = Math.abs(actualPos - expectedPos);
+    
+    if (drift > ALLOWED_SYNC_DRIFT) {
+      logSync(`[SYNC-VERIFY] DRIFT DETECTED: expected=${expectedPos.toFixed(1)}s, actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
+      // Broadcast our actual position so host can correct us if needed
+      sendWs({ type: 'SYNC_CHECK', position: actualPos, expected: expectedPos, drift });
+    } else {
+      logSync(`[SYNC-VERIFY] OK - drift=${drift.toFixed(2)}s within tolerance`);
+    }
+  }, SYNC_VERIFY_INTERVAL);
+  
+  logSync(`[SYNC-VERIFY] Started verification interval (${SYNC_VERIFY_INTERVAL}ms)`);
+}
+
+function handleSyncCheck(msg) {
+  // Only host handles sync check from guests
+  if (!isHostController()) return;
+  
+  const guestPos = msg.position;
+  const guestExpected = msg.expected;
+  const guestDrift = msg.drift;
+  const hostExpected = localPosition;
+  const hostDrift = Math.abs(hostExpected - guestPos);
+  
+  logSync(`[SYNC-CHECK-RCV] From guest: pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, host-view-of-guest-pos=${hostExpected.toFixed(1)}s`);
+  
+  // If guest has significant drift from host's view, send correction
+  if (hostDrift > ALLOWED_SYNC_DRIFT) {
+    logSync(`[SYNC-CORRECT] Correcting guest drift=${hostDrift.toFixed(1)}s, sending SEEK to ${hostExpected.toFixed(1)}s`);
+    // Send direct correction seek
+    sendWs({ type: 'SEEK', position: hostExpected });
+  }
 }
 
 // ── Enter url with Enter key ──────────────────────────────────────────────
 urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') loadVideo(); });
 queueUrlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') addToQueue(); });
+playerArea?.addEventListener('keydown', handlePlayerAreaKeydown);
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────
 (function init() {
+  logSync(`[INIT] Role=${role}, UserId=${userId}, RoomId=${roomId}`);
   applyRoleUI();
   showInviteLink();
   if (role === 'guest') {
     emptyHint.textContent = 'Waiting for the host to load a video…';
   }
+  
+  // Ensure player area is focusable for keyboard controls
+  playerArea?.setAttribute('tabindex', '0');
+  playerArea?.addEventListener('focus', () => {
+    logSync(`[FOCUS] Player area focused`);
+  });
+  
   connect();
 })();

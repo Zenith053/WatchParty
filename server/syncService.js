@@ -170,6 +170,7 @@ function scheduleHostMigration(roomId, departedUserId) {
  * @param {object} _req  The raw HTTP upgrade request (for IP logging)
  */
 function handleConnection(ws, _req) {
+  console.log('[sync] handleConnection called! ws readyState:', ws.readyState);
   let roomId   = null;
   let userId   = null;
   let userRole = 'guest';
@@ -241,6 +242,7 @@ function handleConnection(ws, _req) {
       await clearSkipVotes(roomId);
       broadcast(roomId, { type: 'LOAD', url });
       broadcastSkipStatus(roomId, 0);
+      console.log(`[sync] LOAD room=${roomId} user=${userId}`);
       return;
     }
 
@@ -251,11 +253,16 @@ function handleConnection(ws, _req) {
         return;
       }
       const position = parseFloat(msg.position ?? 0);
-      const status   = msg.type === 'PLAY' ? 'playing' : 'paused';
+      const currentState = msg.type === 'SEEK' ? await getState(roomId) : null;
+      const status =
+        msg.type === 'PLAY' ? 'playing' :
+        msg.type === 'PAUSE' ? 'paused' :
+        currentState?.status ?? 'paused';
 
       await setState(roomId, { position, status });
       // Broadcast to ALL (including host) so the host's own player also commits state
       broadcast(roomId, { type: msg.type, position });
+      console.log(`[sync] ${msg.type} room=${roomId} user=${userId} position=${position}`);
       return;
     }
 
@@ -364,6 +371,20 @@ function handleConnection(ws, _req) {
       if (isAuthorised(userRole)) {
         await playNextFromQueue(roomId);
       }
+      return;
+    }
+
+    // ── SYNC_CHECK (NEW) — guest reports drift, host can verify ──────────
+    if (msg.type === 'SYNC_CHECK') {
+      const guestPos = parseFloat(msg.position ?? 0);
+      const guestExpected = parseFloat(msg.expected ?? 0);
+      const guestDrift = parseFloat(msg.drift ?? 0);
+      
+      // Only host processes and acts on sync checks
+      if (isAuthorised(userRole)) {
+        console.log(`[sync] SYNC_CHECK from guest ${userId}: pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, drift=${guestDrift.toFixed(1)}s`);
+      }
+      // Guest just reports, no broadcast needed (host will act directly)
       return;
     }
 

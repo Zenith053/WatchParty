@@ -41,11 +41,15 @@ async function main() {
   const wss = new WebSocketServer({ noServer: true });
 
   server.on('upgrade', (req, socket, head) => {
+    console.log('[index.js upgrade] Request URL:', req.url);
     if (!req.url.startsWith('/ws')) {
+      console.log('[index.js upgrade] URL does not start with /ws, destroying socket');
       socket.destroy();
       return;
     }
+    console.log('[index.js upgrade] Handling WebSocket upgrade');
     wss.handleUpgrade(req, socket, head, (ws) => {
+      console.log('[index.js upgrade] WebSocket upgraded, emitting connection event');
       wss.emit('connection', ws, req);
     });
   });

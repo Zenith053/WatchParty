@@ -1,6 +1,6 @@
 /**
  * db.js — PostgreSQL connection pool (NFR-08: isolated module)
- * Uses pg Pool; connection string from DATABASE_URL env var.
+ * Uses pg Pool; connection string from WP_DATABASE_URL env var.
  * Exports { pool, query, initDb }
  */
 'use strict';
@@ -9,8 +9,10 @@ const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
 
+const DEFAULT_DATABASE_URL = 'postgresql://127.0.0.1:5432/watchparty';
+
 const pool = new Pool({
-  connectionString: process.env.WP_DATABASE_URL || 'postgresql://localhost:5432/watchparty',
+  connectionString: process.env.WP_DATABASE_URL || DEFAULT_DATABASE_URL,
   max: 10,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
