@@ -17,7 +17,8 @@ const { WebSocketServer } = require('ws');
 
 const { initDb }          = require('./db');
 const { router, staticMiddleware } = require('./gateway');
-const { handleConnection } = require('./syncService');
+const { validateInviteToken } = require('./roomService');
+const { handleConnection }   = require('./syncService');
 
 const PORT = parseInt(process.env.WP_PORT ?? '3000', 10);
 
@@ -40,13 +41,30 @@ async function main() {
   // 4. WebSocket server — upgrade only when path starts with /ws
   const wss = new WebSocketServer({ noServer: true });
 
-  server.on('upgrade', (req, socket, head) => {
+  server.on('upgrade', async (req, socket, head) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
     console.log('[index.js upgrade] Request URL:', req.url);
-    if (!req.url.startsWith('/ws')) {
+
+    if (!url.pathname.startsWith('/ws')) {
       console.log('[index.js upgrade] URL does not start with /ws, destroying socket');
       socket.destroy();
       return;
     }
+
+    // NFR-06: Security — Validate invite token on WebSocket upgrade
+    const roomId = url.searchParams.get('roomId');
+    const token  = url.searchParams.get('token');
+
+    console.log('[index.js upgrade] Validating token for room:', roomId);
+    const { valid, error } = await validateInviteToken(roomId, token);
+
+    if (!valid) {
+      console.log('[index.js upgrade] Security Bypass blocked:', error);
+      socket.write(`HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n${error}`);
+      socket.destroy();
+      return;
+    }
+
     console.log('[index.js upgrade] Handling WebSocket upgrade');
     wss.handleUpgrade(req, socket, head, (ws) => {
       console.log('[index.js upgrade] WebSocket upgraded, emitting connection event');

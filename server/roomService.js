@@ -57,26 +57,29 @@ async function createRoom(req, res) {
 }
 
 /**
- * POST /api/rooms/join
- * Body: { roomId, token, displayName? }
- * Validates invite token (NFR-06), assigns role, returns { userId, role }.
+ * Validate an invite token for a given room.
+ * Checks for:
+ *  - Room existence
+ *  - Token match (constant-time comparison)
+ *  - 24-hour inactivity expiry (NFR-06)
+ *
+ * @param {string} roomId
+ * @param {string} token
+ * @returns {Promise<{ valid: boolean, error?: string }>}
  */
-async function joinRoom(req, res) {
-  const { roomId, token, displayName = 'Guest' } = req.body ?? {};
-
+async function validateInviteToken(roomId, token) {
   if (!roomId || !token) {
-    return res.status(400).json({ error: 'roomId and token are required' });
+    return { valid: false, error: 'roomId and token are required' };
   }
 
   try {
-    // 1. Validate room + token
     const { rows } = await query(
       `SELECT invite_token, last_active_at FROM rooms WHERE id = $1`,
       [roomId]
     );
 
     if (!rows.length) {
-      return res.status(404).json({ error: 'Room not found' });
+      return { valid: false, error: 'Room not found' };
     }
 
     const room = rows[0];
@@ -86,16 +89,46 @@ async function joinRoom(req, res) {
     const provided = Buffer.from(token);
     if (expected.length !== provided.length ||
         !crypto.timingSafeEqual(expected, provided)) {
-      return res.status(403).json({ error: 'Invalid invite token' });
+      return { valid: false, error: 'Invalid invite token' };
     }
 
     // Token expiry: 24 h of inactivity (NFR-06)
     const lastActive = new Date(room.last_active_at);
     const hoursSince = (Date.now() - lastActive.getTime()) / 3_600_000;
     if (hoursSince > TOKEN_EXPIRY_HOURS) {
-      return res.status(403).json({ error: 'Invite link has expired' });
+      return { valid: false, error: 'Invite link has expired' };
     }
 
+    // Refresh last_active_at (NFR-06: 24 hours of inactivity)
+    await query(
+      `UPDATE rooms SET last_active_at = NOW() WHERE id = $1`,
+      [roomId]
+    );
+
+    return { valid: true };
+  } catch (err) {
+    console.error('[roomService] validateInviteToken:', err.message);
+    return { valid: false, error: 'Internal validation error' };
+  }
+}
+
+/**
+ * POST /api/rooms/join
+ * Body: { roomId, token, displayName? }
+ * Validates invite token (NFR-06), assigns role, returns { userId, role }.
+ */
+async function joinRoom(req, res) {
+  const { roomId, token, displayName = 'Guest' } = req.body ?? {};
+
+  const { valid, error } = await validateInviteToken(roomId, token);
+  if (!valid) {
+    let status = 403;
+    if (error === 'Room not found') status = 404;
+    if (error === 'roomId and token are required') status = 400;
+    return res.status(status).json({ error });
+  }
+
+  try {
     // 2. Assign role — first member in the room becomes host
     const { rows: members } = await query(
       `SELECT user_id FROM room_members WHERE room_id = $1`,
@@ -109,12 +142,6 @@ async function joinRoom(req, res) {
        VALUES ($1, $2, $3, $4)
        ON CONFLICT (room_id, user_id) DO NOTHING`,
       [roomId, userId, displayName.slice(0, 32), role]
-    );
-
-    // 3. Refresh last_active_at
-    await query(
-      `UPDATE rooms SET last_active_at = NOW() WHERE id = $1`,
-      [roomId]
     );
 
     return res.status(200).json({ userId, role, roomId });
@@ -149,4 +176,10 @@ async function getMemberCount(roomId) {
   return rows[0]?.count ?? 0;
 }
 
-module.exports = { createRoom, joinRoom, promoteToHost, getMemberCount };
+module.exports = {
+  createRoom,
+  joinRoom,
+  promoteToHost,
+  getMemberCount,
+  validateInviteToken,
+};

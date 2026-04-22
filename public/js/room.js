@@ -678,7 +678,7 @@ function onVideoEnded() {
 // ══════════════════════════════════════════════════════════════════════════
 // WebSocket Connection
 // ══════════════════════════════════════════════════════════════════════════
-const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?roomId=${roomId}&token=${token}`;
 let ws;
 let reconnectAttempts = 0;
 const MAX_RECONNECT   = 5;
