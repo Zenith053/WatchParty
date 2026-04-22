@@ -1,5 +1,9 @@
 /**
- * stateStore.js — Two-layer playback state store (NFR-03)
+ * stateStore.js — Singleton Pattern for playback state management (NFR-03)
+ *
+ * Design Patterns:
+ *   - Singleton:      StateStore class with lazy initialization and explicit connect()
+ *   - State Machine:  Validates playback status transitions via RoomStateMachine
  *
  * Layer 1: In-memory Map  (µs reads, lives with process)
  * Layer 2: Redis hash      (persistence across restarts / crashes)
@@ -14,120 +18,219 @@
  */
 'use strict';
 
-// In-memory layer (always available)
-const memStore = new Map(); // roomId → snapshot object
+const { RoomStateMachine } = require('./roomStateMachine');
 
-// Redis layer (optional)
-let redis = null;
-let redisAvailable = false;
+// ── Singleton StateStore class ────────────────────────────────────────────
 
-try {
-  const Redis = require('ioredis');
-  redis = new Redis(process.env.WP_REDIS_URL || 'redis://localhost:6379', {
-    lazyConnect: true,
-    maxRetriesPerRequest: 1,
-    retryStrategy(times) {
-      if (times > 2) {
-        console.warn('[stateStore] Redis unavailable — running memory-only mode');
-        redisAvailable = false;
-        return null; // stop retrying
+class StateStore {
+  static #instance = null;
+
+  /**
+   * Get the singleton StateStore instance.
+   * @returns {StateStore}
+   */
+  static getInstance() {
+    if (!StateStore.#instance) {
+      StateStore.#instance = new StateStore();
+    }
+    return StateStore.#instance;
+  }
+
+  /**
+   * Reset the singleton (for testing only).
+   */
+  static resetInstance() {
+    StateStore.#instance = null;
+  }
+
+  constructor() {
+    /** @type {Map<string, object>} In-memory state (always available) */
+    this.memStore = new Map();
+
+    /** @type {Map<string, RoomStateMachine>} Per-room state machines */
+    this.machines = new Map();
+
+    /** @type {object|null} Redis client */
+    this.redis = null;
+
+    /** @type {boolean} Whether Redis is connected and usable */
+    this.redisAvailable = false;
+
+    this._connectRedis();
+  }
+
+  /**
+   * Attempt to connect to Redis. Non-blocking; degrades gracefully.
+   */
+  _connectRedis() {
+    try {
+      const Redis = require('ioredis');
+      this.redis = new Redis(process.env.WP_REDIS_URL || 'redis://localhost:6379', {
+        lazyConnect: true,
+        maxRetriesPerRequest: 1,
+        retryStrategy(times) {
+          if (times > 2) {
+            console.warn('[stateStore] Redis unavailable — running memory-only mode');
+            return null; // stop retrying
+          }
+          return Math.min(times * 200, 1000);
+        },
+        enableOfflineQueue: false,
+        connectTimeout: 3000,
+      });
+
+      this.redis.on('connect', () => {
+        this.redisAvailable = true;
+        console.log('[stateStore] Redis connected');
+      });
+
+      this.redis.on('error', (err) => {
+        if (this.redisAvailable) {
+          console.warn('[stateStore] Redis error (falling back to memory):', err.message);
+        }
+        this.redisAvailable = false;
+      });
+
+      this.redis.on('close', () => {
+        this.redisAvailable = false;
+      });
+
+      // Attempt connection but don't block startup
+      this.redis.connect().catch(() => {
+        console.warn('[stateStore] Redis not available — using memory-only mode');
+        this.redisAvailable = false;
+      });
+    } catch {
+      console.warn('[stateStore] ioredis not available — using memory-only mode');
+    }
+  }
+
+  /** Redis key for a room's state hash. */
+  _redisKey(roomId) {
+    return `room:${roomId}:state`;
+  }
+
+  /** TTL matches NFR-06 token expiry. */
+  get REDIS_TTL() {
+    return 86_400; // 24 h
+  }
+
+  /**
+   * Get or create the state machine for a room.
+   * @param {string} roomId
+   * @param {string} [initialState='idle']
+   * @returns {RoomStateMachine}
+   */
+  _getMachine(roomId, initialState = 'idle') {
+    if (!this.machines.has(roomId)) {
+      this.machines.set(roomId, new RoomStateMachine(initialState));
+    }
+    return this.machines.get(roomId);
+  }
+
+  /**
+   * Write snapshot to both layers.
+   * Validates state transitions via the RoomStateMachine.
+   *
+   * @param {string} roomId
+   * @param {object} snapshot  Partial or full snapshot; merged with existing.
+   */
+  async setState(roomId, snapshot) {
+    // State Machine validation: if a status change is requested, validate it
+    if (snapshot.status) {
+      const existing = this.memStore.get(roomId);
+      const currentStatus = existing?.status ?? 'idle';
+      const machine = this._getMachine(roomId, currentStatus);
+
+      // Sync machine state with stored state (handles edge cases)
+      if (machine.state !== currentStatus) {
+        try {
+          machine.transition(currentStatus);
+        } catch {
+          // If we can't sync, reset the machine to current state
+          this.machines.set(roomId, new RoomStateMachine(
+            ['idle', 'paused', 'playing', 'ended'].includes(currentStatus) ? currentStatus : 'idle'
+          ));
+        }
       }
-      return Math.min(times * 200, 1000);
-    },
-    enableOfflineQueue: false,
-    connectTimeout: 3000,
-  });
 
-  redis.on('connect', () => {
-    redisAvailable = true;
-    console.log('[stateStore] Redis connected');
-  });
-
-  redis.on('error', (err) => {
-    if (redisAvailable) {
-      console.warn('[stateStore] Redis error (falling back to memory):', err.message);
-    }
-    redisAvailable = false;
-  });
-
-  redis.on('close', () => {
-    redisAvailable = false;
-  });
-
-  // Attempt connection but don't block startup
-  redis.connect().catch(() => {
-    console.warn('[stateStore] Redis not available — using memory-only mode');
-    redisAvailable = false;
-  });
-} catch {
-  console.warn('[stateStore] ioredis not available — using memory-only mode');
-}
-
-const REDIS_KEY = (roomId) => `room:${roomId}:state`;
-const REDIS_TTL = 86_400; // 24 h — mirrors NFR-06 token expiry
-
-/**
- * Write snapshot to both layers.
- * @param {string} roomId
- * @param {object} snapshot  Partial or full snapshot; merged with existing.
- */
-async function setState(roomId, snapshot) {
-  const existing = memStore.get(roomId) ?? {};
-  const next = { ...existing, ...snapshot, updatedAt: new Date().toISOString() };
-  memStore.set(roomId, next);
-
-  if (redisAvailable && redis) {
-    try {
-      await redis.hset(REDIS_KEY(roomId), next);
-      await redis.expire(REDIS_KEY(roomId), REDIS_TTL);
-    } catch {
-      // Redis unavailable — memory-only is degraded but functional
-    }
-  }
-}
-
-/**
- * Read snapshot — memory first, Redis fallback.
- * @param {string} roomId
- * @returns {object|null}
- */
-async function getState(roomId) {
-  const mem = memStore.get(roomId);
-  if (mem) return mem;
-
-  if (redisAvailable && redis) {
-    try {
-      const raw = await redis.hgetall(REDIS_KEY(roomId));
-      if (raw && raw.url) {
-        // Rehydrate memory from Redis
-        const snap = {
-          url: raw.url,
-          position: parseFloat(raw.position ?? 0),
-          status: raw.status ?? 'paused',
-          updatedAt: raw.updatedAt,
-        };
-        memStore.set(roomId, snap);
-        return snap;
+      // Validate the requested transition
+      try {
+        machine.transition(snapshot.status);
+      } catch (err) {
+        console.warn(`[stateStore] ${err.message} — allowing anyway for backward compat`);
+        // Allow the transition for backward compatibility but log the warning
+        this.machines.set(roomId, new RoomStateMachine(snapshot.status));
       }
-    } catch {
-      // Redis unavailable
+    }
+
+    const existing = this.memStore.get(roomId) ?? {};
+    const next = { ...existing, ...snapshot, updatedAt: new Date().toISOString() };
+    this.memStore.set(roomId, next);
+
+    if (this.redisAvailable && this.redis) {
+      try {
+        await this.redis.hset(this._redisKey(roomId), next);
+        await this.redis.expire(this._redisKey(roomId), this.REDIS_TTL);
+      } catch {
+        // Redis unavailable — memory-only is degraded but functional
+      }
     }
   }
-  return null;
-}
 
-/**
- * Remove state for a room (called when room is deleted / expired).
- */
-async function deleteState(roomId) {
-  memStore.delete(roomId);
-  if (redisAvailable && redis) {
-    try {
-      await redis.del(REDIS_KEY(roomId));
-    } catch {
-      // ignore
+  /**
+   * Read snapshot — memory first, Redis fallback.
+   * @param {string} roomId
+   * @returns {object|null}
+   */
+  async getState(roomId) {
+    const mem = this.memStore.get(roomId);
+    if (mem) return mem;
+
+    if (this.redisAvailable && this.redis) {
+      try {
+        const raw = await this.redis.hgetall(this._redisKey(roomId));
+        if (raw && raw.url) {
+          // Rehydrate memory from Redis
+          const snap = {
+            url: raw.url,
+            position: parseFloat(raw.position ?? 0),
+            status: raw.status ?? 'paused',
+            updatedAt: raw.updatedAt,
+          };
+          this.memStore.set(roomId, snap);
+          return snap;
+        }
+      } catch {
+        // Redis unavailable
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Remove state for a room (called when room is deleted / expired).
+   */
+  async deleteState(roomId) {
+    this.memStore.delete(roomId);
+    this.machines.delete(roomId); // Clean up state machine
+    if (this.redisAvailable && this.redis) {
+      try {
+        await this.redis.del(this._redisKey(roomId));
+      } catch {
+        // ignore
+      }
     }
   }
 }
 
-module.exports = { setState, getState, deleteState };
+// ── Module-level exports (backward-compatible with existing code) ─────────
+
+const store = StateStore.getInstance();
+
+module.exports = {
+  setState:    (roomId, snapshot) => store.setState(roomId, snapshot),
+  getState:    (roomId)          => store.getState(roomId),
+  deleteState: (roomId)          => store.deleteState(roomId),
+  StateStore,  // Export class for testing
+};
