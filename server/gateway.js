@@ -33,6 +33,33 @@ function rateLimiter(req, res, next) {
   return next();
 }
 
+/**
+ * NFR-04: Periodic cleanup to prevent ipWindows Map from leaking memory.
+ * Removes IP entries where all hits are older than WINDOW_MS.
+ */
+function pruneRateLimiter() {
+  const now = Date.now();
+  let pruned = 0;
+  for (const [ip, hits] of ipWindows.entries()) {
+    const remains = hits.filter(t => now - t < WINDOW_MS);
+    if (remains.length === 0) {
+      ipWindows.delete(ip);
+      pruned++;
+    } else {
+      ipWindows.set(ip, remains);
+    }
+  }
+  if (pruned > 0 && process.env.WP_NODE_ENV !== 'test') {
+    console.debug(`[gateway] Pruned ${pruned} stale IPs from rate limiter`);
+  }
+}
+
+// Prune every 5 minutes
+const PRUNE_INTERVAL_MS = 5 * 60_000;
+const pruneTimer = setInterval(pruneRateLimiter, PRUNE_INTERVAL_MS);
+// Allow process to exit if only the timer is left
+if (pruneTimer.unref) pruneTimer.unref();
+
 // ── JSON body parsing ──────────────────────────────────────────────────────
 router.use(express.json({ limit: '16kb' }));
 router.use(rateLimiter);

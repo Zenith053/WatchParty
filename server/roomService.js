@@ -31,12 +31,28 @@ function inviteLink(req, roomId, token) {
 
 // ── Handlers ───────────────────────────────────────────────────────────────
 
+const MAX_ROOMS = 20;
+
 /**
  * POST /api/rooms
  * Creates a new room. No auth required (NFR-05).
  */
 async function createRoom(req, res) {
   try {
+    // NFR-04: Enforce max 20 simultaneous rooms
+    const threshold = new Date(Date.now() - TOKEN_EXPIRY_HOURS * 3_600_000).toISOString();
+    const { rows: countRows } = await query(
+      `SELECT COUNT(*)::int AS count FROM rooms WHERE last_active_at > $1`,
+      [threshold]
+    );
+    const activeRooms = countRows[0]?.count ?? 0;
+
+    if (activeRooms >= MAX_ROOMS) {
+      return res.status(403).json({
+        error: `Server capacity reached (max ${MAX_ROOMS} rooms). Please try again later.`
+      });
+    }
+
     const roomId = uuidv7();
     const token  = makeInviteToken();
 

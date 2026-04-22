@@ -53,6 +53,17 @@ async function query(text, params = []) {
     return { rows: [], rowCount: room ? 1 : 0 };
   }
 
+  // SELECT COUNT(*) FROM rooms (simultaneous/active check)
+  if (/SELECT COUNT.*FROM rooms/i.test(sql)) {
+    let count = rooms.size;
+    // If a timestamp is provided (last_active_at > $1), filter by it
+    if (params.length > 0 && /last_active_at >/i.test(sql)) {
+      const threshold = new Date(params[0]);
+      count = [...rooms.values()].filter(r => new Date(r.last_active_at) > threshold).length;
+    }
+    return { rows: [{ count }], rowCount: 1 };
+  }
+
   // ── room_members ───────────────────────────────────────────────────────
 
   // SELECT user_id FROM room_members WHERE room_id = $1

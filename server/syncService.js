@@ -209,7 +209,16 @@ function handleConnection(ws, _req) {
       userRole = msg.role ?? 'guest';
 
       if (!rooms.has(roomId)) rooms.set(roomId, new Map());
-      rooms.get(roomId).set(userId, {
+      const members = rooms.get(roomId);
+
+      // NFR-04: Enforce max 10 members per room
+      if (members.size >= 10 && !members.has(userId)) {
+        send(ws, { type: 'ERROR', message: 'Room is full (max 10 users)' });
+        ws.close();
+        return;
+      }
+
+      members.set(userId, {
         ws, userId, role: userRole,
         displayName: msg.displayName ?? 'Guest',
         joinedAt: Date.now(),
