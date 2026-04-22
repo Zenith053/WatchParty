@@ -30,7 +30,7 @@ function rateLimiter(req, res, next) {
   if (hits.length > RATE_LIMIT) {
     return res.status(429).json({ error: 'Too many requests — slow down' });
   }
-  next();
+  return next();
 }
 
 // ── JSON body parsing ──────────────────────────────────────────────────────

@@ -80,7 +80,7 @@ jest.mock('../server/queueService', () => ({
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const WebSocket = require('ws');
-const { handleConnection } = require('../server/syncService');
+const { handleConnection, _resetSyncService } = require('../server/syncService');
 
 // ── Test helpers ──────────────────────────────────────────────────────────
 
@@ -136,10 +136,13 @@ async function waitForMsg(ws, type, timeoutMs = 2000) {
 let server, port;
 const ROOM = 'test-room-001';
 
-beforeAll(async () => ({ server, port } = await startServer()));
+beforeAll(async () => {
+  ({ server, port } = await startServer());
+});
 afterAll(()  => server.close());
 
 beforeEach(() => {
+  _resetSyncService();
   mockQueueStore.length = 0;
   mockQueueVotes.clear();
   mockSkipVotes.clear();

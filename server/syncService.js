@@ -60,6 +60,14 @@ const MAX_CHAT_HISTORY = 200;
 
 const HOST_MIGRATION_DELAY_MS = 2_500; // promote within 3 s (NFR-03)
 
+/**
+ * RESET function ONLY for testing purposes to avoid cross-test state leakage.
+ */
+function _resetSyncService() {
+  rooms.clear();
+  chatHistory.clear();
+}
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function send(ws, obj) {
@@ -145,11 +153,11 @@ async function playNextFromQueue(roomId) {
 
 // ── Host Migration (FR-07 / NFR-03) ────────────────────────────────────────
 
-function scheduleHostMigration(roomId, departedUserId) {
+function scheduleHostMigration(roomId, _departedUserId) {
   const members = rooms.get(roomId);
   if (!members || members.size === 0) return;
 
-  const migrationTimer = setTimeout(async () => {
+  setTimeout(async () => {
     const current = rooms.get(roomId);
     if (!current || current.size === 0) return;
 
@@ -451,6 +459,7 @@ function handleConnection(ws, _req) {
       }
       const member = rooms.get(roomId)?.get(userId);
       if (member) {
+        const oldName = member.displayName;
         member.displayName = newName;
         // Persist to DB
         try {
@@ -466,11 +475,11 @@ function handleConnection(ws, _req) {
           type: 'CHAT_MSG',
           userId: 'system',
           displayName: 'System',
-          text: `${member.displayName} is now known as ${newName}`,
+          text: `${oldName} is now known as ${newName}`,
           timestamp: new Date().toISOString(),
           isSystem: true,
         });
-        console.log(`[sync] ${userId} changed name to "${newName}" in room ${roomId}`);
+        console.log(`[sync] ${userId} changed name from "${oldName}" to "${newName}" in room ${roomId}`);
       }
       return;
     }
@@ -541,4 +550,4 @@ function normaliseUrl(raw) {
   }
 }
 
-module.exports = { handleConnection };
+module.exports = { handleConnection, _resetSyncService };

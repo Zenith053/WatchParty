@@ -7,8 +7,6 @@
  */
 'use strict';
 
-const crypto = require('crypto');
-
 // ── In-memory tables ───────────────────────────────────────────────────────
 const rooms = new Map();        // id → { id, invite_token, created_at, last_active_at }
 const roomMembers = new Map();  // `${room_id}:${user_id}` → { room_id, user_id, display_name, role, joined_at }
@@ -102,8 +100,8 @@ async function query(text, params = []) {
 
   // ── queue ──────────────────────────────────────────────────────────────
 
-  // INSERT INTO queue
-  if (/INSERT INTO queue/i.test(sql)) {
+  // INSERT INTO queue (not queue_votes)
+  if (/INSERT INTO queue\b(?!_)/i.test(sql)) {
     const [room_id, url, added_by] = params;
     const id = ++queueSerial;
     const entry = { id, room_id, url, added_by, upvotes: 0, added_at: new Date().toISOString() };
@@ -210,4 +208,13 @@ async function initDb() {
   console.log('[memoryDb] In-memory database initialised (no PostgreSQL)');
 }
 
-module.exports = { pool: null, query, initDb };
+function _resetMemoryDb() {
+  rooms.clear();
+  roomMembers.clear();
+  queue.clear();
+  queueVotes.clear();
+  skipVotes.clear();
+  queueSerial = 0;
+}
+
+module.exports = { pool: null, query, initDb, _resetMemoryDb };

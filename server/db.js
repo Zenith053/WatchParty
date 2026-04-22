@@ -72,6 +72,7 @@ async function initDb() {
     memoryDb = require('./memoryDb');
     await memoryDb.initDb();
   }
+  return undefined;
 }
 
 module.exports = { pool, query, initDb };

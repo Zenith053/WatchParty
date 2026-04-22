@@ -45,7 +45,7 @@ jest.mock('../server/db', () => {
 
 const express  = require('express');
 const request  = require('supertest');
-const { router, staticMiddleware } = require('../server/gateway');
+const { router } = require('../server/gateway');
 
 function buildApp() {
   const app = express();

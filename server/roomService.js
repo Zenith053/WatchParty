@@ -117,10 +117,10 @@ async function joinRoom(req, res) {
       [roomId]
     );
 
-    res.status(200).json({ userId, role, roomId });
+    return res.status(200).json({ userId, role, roomId });
   } catch (err) {
     console.error('[roomService] joinRoom:', err.message);
-    res.status(500).json({ error: 'Failed to join room' });
+    return res.status(500).json({ error: 'Failed to join room' });
   }
 }
 

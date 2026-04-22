@@ -6,106 +6,104 @@
 'use strict';
 
 // ── Mock DB ───────────────────────────────────────────────────────────────
-const queueStore = [];
-const queueVotes = new Map(); // `${queueId}-${userId}` → true
-const skipVotes  = new Map(); // `${roomId}-${userId}` → true
-let queueIdCounter = 1;
+const mockQueueStore = [];
+const mockQueueVotes = new Map();
+const mockSkipVotes = new Map();
+let mockQueueIdCounter = 1;
 
 jest.mock('../server/db', () => ({
   initDb: jest.fn().mockResolvedValue(undefined),
-  query: jest.fn(async (sql, params) => {
-    // INSERT INTO queue
-    if (sql.startsWith('INSERT INTO queue')) {
+  query: jest.fn(async (text, params) => {
+    const sql = text.replace(/\s+/g, ' ').trim();
+
+    // ── queue_votes (must check BEFORE generic queue) ──────────────────
+    if (/^INSERT INTO queue_votes/i.test(sql)) {
+      const key = `${params[0]}-${params[1]}`;
+      if (mockQueueVotes.has(key)) {
+        const err = new Error('duplicate key');
+        err.code = '23505';
+        throw err;
+      }
+      mockQueueVotes.set(key, true);
+      return { rows: [] };
+    }
+
+    // ── skip_votes (must check BEFORE generic queue) ──────────────────
+    if (/^INSERT INTO skip_votes/i.test(sql)) {
+      const key = `${params[0]}-${params[1]}`;
+      if (mockSkipVotes.has(key)) {
+        const err = new Error('duplicate key');
+        err.code = '23505';
+        throw err;
+      }
+      mockSkipVotes.set(key, true);
+      return { rows: [] };
+    }
+
+    if (/SELECT COUNT.*FROM skip_votes/i.test(sql)) {
+      const roomId = params[0];
+      let count = 0;
+      for (const key of mockSkipVotes.keys()) {
+        if (key.startsWith(`${roomId}-`)) count++;
+      }
+      return { rows: [{ count }] };
+    }
+
+    if (/^DELETE FROM skip_votes/i.test(sql)) {
+      const roomId = params[0];
+      for (const key of [...mockSkipVotes.keys()]) {
+        if (key.startsWith(`${roomId}-`)) mockSkipVotes.delete(key);
+      }
+      return { rows: [] };
+    }
+
+    // ── queue ──────────────────────────────────────────────────────────
+    if (/^INSERT INTO queue\b/i.test(sql) && !/queue_votes/i.test(sql)) {
       const entry = {
-        id: queueIdCounter++,
+        id: mockQueueIdCounter++,
         room_id: params[0],
         url: params[1],
         added_by: params[2],
         upvotes: 0,
         added_at: new Date().toISOString(),
       };
-      queueStore.push(entry);
+      mockQueueStore.push(entry);
       return { rows: [entry] };
     }
 
-    // SELECT queue entries
-    if (sql.includes('FROM queue') && sql.includes('ORDER BY')) {
+    // specific DELETE popTopEntry (MUST BE BEFORE SELECT)
+    if (/^DELETE FROM queue.*SELECT id FROM queue/i.test(sql)) {
       const roomId = params[0];
-      const entries = queueStore
+      const sorted = mockQueueStore
+        .filter(e => e.room_id === roomId)
+        .sort((a, b) => b.upvotes - a.upvotes || new Date(a.added_at) - new Date(b.added_at));
+      if (sorted.length === 0) return { rows: [] };
+      const top = sorted[0];
+      const idx = mockQueueStore.findIndex(e => e.id === top.id);
+      mockQueueStore.splice(idx, 1);
+      return { rows: [top] };
+    }
+
+    // specific DELETE removeFromQueue (MUST BE BEFORE SELECT)
+    if (/^DELETE FROM queue WHERE id = \$\d+$/i.test(sql)) {
+      const idx = mockQueueStore.findIndex(e => e.id === params[0]);
+      if (idx >= 0) mockQueueStore.splice(idx, 1);
+      return { rows: [] };
+    }
+
+    if (/SELECT.*FROM queue.*ORDER BY/i.test(sql)) {
+      const roomId = params[0];
+      const entries = mockQueueStore
         .filter(e => e.room_id === roomId)
         .sort((a, b) => b.upvotes - a.upvotes || new Date(a.added_at) - new Date(b.added_at));
       return { rows: entries };
     }
 
-    // INSERT INTO queue_votes
-    if (sql.startsWith('INSERT INTO queue_votes')) {
-      const key = `${params[0]}-${params[1]}`;
-      if (queueVotes.has(key)) {
-        const err = new Error('duplicate key');
-        err.code = '23505';
-        throw err;
-      }
-      queueVotes.set(key, true);
-      return { rows: [] };
-    }
-
-    // UPDATE queue upvotes
-    if (sql.startsWith('UPDATE queue SET upvotes')) {
-      const entry = queueStore.find(e => e.id === params[0]);
+    if (/^UPDATE queue SET upvotes/i.test(sql)) {
+      const entry = mockQueueStore.find(e => e.id === params[0]);
       if (entry) {
         entry.upvotes++;
         return { rows: [{ upvotes: entry.upvotes }] };
-      }
-      return { rows: [] };
-    }
-
-    // DELETE FROM queue (pop top)
-    if (sql.startsWith('DELETE FROM queue') && sql.includes('SELECT id FROM queue')) {
-      const roomId = params[0];
-      const sorted = queueStore
-        .filter(e => e.room_id === roomId)
-        .sort((a, b) => b.upvotes - a.upvotes || new Date(a.added_at) - new Date(b.added_at));
-      if (sorted.length === 0) return { rows: [] };
-      const top = sorted[0];
-      const idx = queueStore.findIndex(e => e.id === top.id);
-      queueStore.splice(idx, 1);
-      return { rows: [top] };
-    }
-
-    // DELETE FROM queue (remove by id)
-    if (sql.startsWith('DELETE FROM queue WHERE id')) {
-      const idx = queueStore.findIndex(e => e.id === params[0]);
-      if (idx >= 0) queueStore.splice(idx, 1);
-      return { rows: [] };
-    }
-
-    // INSERT INTO skip_votes
-    if (sql.startsWith('INSERT INTO skip_votes')) {
-      const key = `${params[0]}-${params[1]}`;
-      if (skipVotes.has(key)) {
-        const err = new Error('duplicate key');
-        err.code = '23505';
-        throw err;
-      }
-      skipVotes.set(key, true);
-      return { rows: [] };
-    }
-
-    // COUNT skip_votes
-    if (sql.includes('COUNT') && sql.includes('skip_votes')) {
-      const roomId = params[0];
-      let count = 0;
-      for (const key of skipVotes.keys()) {
-        if (key.startsWith(`${roomId}-`)) count++;
-      }
-      return { rows: [{ count }] };
-    }
-
-    // DELETE FROM skip_votes
-    if (sql.startsWith('DELETE FROM skip_votes')) {
-      const roomId = params[0];
-      for (const key of [...skipVotes.keys()]) {
-        if (key.startsWith(`${roomId}-`)) skipVotes.delete(key);
       }
       return { rows: [] };
     }
@@ -121,10 +119,10 @@ const {
 
 // Reset stores between tests
 beforeEach(() => {
-  queueStore.length = 0;
-  queueVotes.clear();
-  skipVotes.clear();
-  queueIdCounter = 1;
+  mockQueueStore.length = 0;
+  mockQueueVotes.clear();
+  mockSkipVotes.clear();
+  mockQueueIdCounter = 1;
 });
 
 // ── FR-05: Queue Operations ──────────────────────────────────────────────
