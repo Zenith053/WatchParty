@@ -5,6 +5,7 @@
 'use strict';
 
 const BaseCommand = require('./BaseCommand');
+const { query } = require('../db');
 
 class SetNameCommand extends BaseCommand {
   validate(msg) {
@@ -17,16 +18,16 @@ class SetNameCommand extends BaseCommand {
 
   async execute(msg) {
     const newName = (msg.displayName ?? '').trim().slice(0, 32);
-    const member = this.ctx.rooms.get(this.roomId)?.get(this.userId);
+    const member = this.ctx.getMember(this.userId);
 
     if (member) {
       const oldName = member.displayName;
-      member.displayName = newName;
+      // Use RoomMember.rename() instead of direct mutation (Smell #9 fix)
+      member.rename(newName);
 
-      // Persist to DB
+      // Persist to DB (module-level import — Smell #7 fix)
       try {
-        const { query: dbQuery } = require('../db');
-        await dbQuery(
+        await query(
           `UPDATE room_members SET display_name = $1 WHERE room_id = $2 AND user_id = $3`,
           [newName, this.roomId, this.userId]
         );

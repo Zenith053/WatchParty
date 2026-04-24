@@ -15,7 +15,8 @@ class SkipVoteCommand extends BaseCommand {
       return;
     }
 
-    const totalMembers = this.ctx.rooms.get(this.roomId)?.size ?? 0;
+    // Use ctx.getMemberCount() instead of raw Map access (Smell #6 fix)
+    const totalMembers = this.ctx.getMemberCount();
     this.ctx.broadcastSkipStatus(result.count);
 
     // Check majority → auto-play next

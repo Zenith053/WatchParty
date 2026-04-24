@@ -14,16 +14,18 @@
 class BaseCommand {
   /**
    * @param {object} context  Per-message execution context
-   * @param {string} context.roomId
-   * @param {string} context.userId
-   * @param {string} context.userRole
-   * @param {WebSocket} context.ws
-   * @param {Function} context.send        send(obj) → send to this client
-   * @param {Function} context.broadcast   broadcast(obj, excludeUserId?) → send to room
-   * @param {Function} context.broadcastMemberList  → refresh member list for room
-   * @param {Map}      context.rooms       roomId → Map<userId, memberInfo>
-   * @param {Map}      context.chatHistory roomId → [chatMessage]
-   * @param {object}   context.eventBus    RoomEventBus singleton
+   * @param {string}      context.roomId
+   * @param {string}      context.userId
+   * @param {string}      context.userRole
+   * @param {WebSocket}   context.ws
+   * @param {RoomManager} context.roomManager   Room member registry
+   * @param {ChatService} context.chatService   Chat history store
+   * @param {object}      context.eventBus      RoomEventBus singleton
+   * @param {Function}    context.getMember      getMember(userId?) → RoomMember
+   * @param {Function}    context.getMemberCount getMemberCount() → number
+   * @param {Function}    context.send           send(obj) → send to this client
+   * @param {Function}    context.broadcast      broadcast(obj, excludeUserId?) → send to room
+   * @param {Function}    context.broadcastMemberList → refresh member list for room
    */
   constructor(context) {
     this.ctx = context;

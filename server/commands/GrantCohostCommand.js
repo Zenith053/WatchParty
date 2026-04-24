@@ -18,14 +18,14 @@ class GrantCohostCommand extends BaseCommand {
   }
 
   async execute(msg) {
-    const members = this.ctx.rooms.get(this.roomId);
-    const target = members?.get(msg.targetUserId);
+    const target = this.ctx.getMember(msg.targetUserId);
     if (!target) {
       this.send({ type: 'ERROR', message: 'Target user not in room' });
       return;
     }
 
-    target.role = 'co-host';
+    // Use RoomMember.promote() instead of direct mutation (Smell #9 fix)
+    target.promote('co-host');
 
     // Notify the promoted user directly
     if (target.ws.readyState === 1) {

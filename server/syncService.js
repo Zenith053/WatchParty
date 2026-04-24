@@ -7,7 +7,7 @@
  *   - Observer:  Events are emitted on the RoomEventBus for decoupled consumers
  *                 (logging, analytics, future modules).
  *   - Mediator:  This module mediates all room communication. Per-room state
- *                 (members, chat history) is managed centrally.
+ *                 is managed via RoomManager and ChatService (extracted classes).
  *
  * FR-02 Playback Sync:   host PLAY/PAUSE/SEEK → broadcast to all guests (≤1 s, NFR-01)
  * FR-03 Late-Join:       CATCHUP snapshot sent immediately on JOIN
@@ -55,16 +55,17 @@
 const { setState, getState } = require('./stateStore');
 const { promoteToHost }       = require('./roomService');
 const { getQueue, popTopEntry, clearSkipVotes } = require('./queueService');
+const { normaliseUrl }        = require('./urlUtils');
 const CommandRegistry         = require('./commands/CommandRegistry');
 const { eventBus }            = require('./eventBus');
+const RoomManager             = require('./RoomManager');
+const RoomMember              = require('./RoomMember');
+const ChatService             = require('./ChatService');
 
-// ── Shared State (Mediator pattern — centralised per-room state) ─────────
+// ── Extracted services (replacing raw Maps — Design Smells #1, #3, #5, #6) ──
 
-// roomId → Map<userId, { ws, role, joinedAt, displayName, userId }>
-const rooms = new Map();
-
-// FR-10: Chat history per room (in-memory, capped at 200 messages)
-const chatHistory = new Map(); // roomId → [{ userId, displayName, text, emoji, type, timestamp }]
+const roomManager = new RoomManager();
+const chatService = new ChatService();
 
 const HOST_MIGRATION_DELAY_MS = 2_500; // promote within 3 s (NFR-03)
 
@@ -72,36 +73,11 @@ const HOST_MIGRATION_DELAY_MS = 2_500; // promote within 3 s (NFR-03)
  * RESET function ONLY for testing purposes to avoid cross-test state leakage.
  */
 function _resetSyncService() {
-  rooms.clear();
-  chatHistory.clear();
+  roomManager.reset();
+  chatService.reset();
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-function send(ws, obj) {
-  if (ws.readyState === 1 /* OPEN */) {
-    ws.send(JSON.stringify(obj));
-  }
-}
-
-function broadcast(roomId, obj, excludeUserId = null) {
-  const members = rooms.get(roomId);
-  if (!members) return;
-  for (const [uid, { ws }] of members) {
-    if (uid !== excludeUserId) send(ws, obj);
-  }
-}
-
-function broadcastMemberList(roomId) {
-  const members = rooms.get(roomId);
-  if (!members) return;
-  const list = [...members.values()].map(m => ({
-    userId: m.userId,
-    displayName: m.displayName,
-    role: m.role,
-  }));
-  broadcast(roomId, { type: 'MEMBER_LIST', members: list });
-}
+// ── Queue & Skip Helpers ──────────────────────────────────────────────────
 
 /**
  * Broadcast the current queue list to all room members (FR-05).
@@ -109,7 +85,7 @@ function broadcastMemberList(roomId) {
 async function broadcastQueue(roomId) {
   try {
     const queue = await getQueue(roomId);
-    broadcast(roomId, { type: 'QUEUE_UPDATE', queue });
+    roomManager.broadcast(roomId, { type: 'QUEUE_UPDATE', queue });
   } catch (err) {
     console.error('[sync] broadcastQueue error:', err.message);
   }
@@ -119,10 +95,9 @@ async function broadcastQueue(roomId) {
  * Broadcast skip vote status to all room members (FR-06).
  */
 function broadcastSkipStatus(roomId, count) {
-  const members = rooms.get(roomId);
-  const totalMembers = members ? members.size : 0;
+  const totalMembers = roomManager.getMemberCount(roomId);
   const needed = Math.floor(totalMembers / 2) + 1;
-  broadcast(roomId, { type: 'SKIP_STATUS', count, needed });
+  roomManager.broadcast(roomId, { type: 'SKIP_STATUS', count, needed });
 }
 
 /**
@@ -133,7 +108,7 @@ async function playNextFromQueue(roomId) {
   try {
     const entry = await popTopEntry(roomId);
     if (!entry) {
-      broadcast(roomId, { type: 'QUEUE_EMPTY' });
+      roomManager.broadcast(roomId, { type: 'QUEUE_EMPTY' });
       return;
     }
 
@@ -141,10 +116,10 @@ async function playNextFromQueue(roomId) {
     await setState(roomId, { url, position: 0, status: 'playing' });
     await clearSkipVotes(roomId);
 
-    broadcast(roomId, { type: 'LOAD', url });
+    roomManager.broadcast(roomId, { type: 'LOAD', url });
     // Auto-play after a brief delay for iframe load
     setTimeout(() => {
-      broadcast(roomId, { type: 'PLAY', position: 0 });
+      roomManager.broadcast(roomId, { type: 'PLAY', position: 0 });
     }, 500);
 
     await broadcastQueue(roomId);
@@ -157,32 +132,14 @@ async function playNextFromQueue(roomId) {
   }
 }
 
-// ── URL normalisation (YouTube → nocookie embed) ──────────────────────────
-
-function normaliseUrl(raw) {
-  try {
-    const url = new URL(raw);
-    let videoId = url.searchParams.get('v');
-    if (!videoId && url.hostname === 'youtu.be') {
-      videoId = url.pathname.slice(1);
-    }
-    if (videoId) {
-      return `https://www.youtube-nocookie.com/embed/${videoId}?enablejsapi=1&rel=0`;
-    }
-    return raw;
-  } catch {
-    return null;
-  }
-}
-
 // ── Host Migration (FR-07 / NFR-03) ────────────────────────────────────────
 
 function scheduleHostMigration(roomId, _departedUserId) {
-  const members = rooms.get(roomId);
+  const members = roomManager.getMembers(roomId);
   if (!members || members.size === 0) return;
 
   setTimeout(async () => {
-    const current = rooms.get(roomId);
+    const current = roomManager.getMembers(roomId);
     if (!current || current.size === 0) return;
 
     // Still no host? Pick the longest-connected guest.
@@ -193,15 +150,15 @@ function scheduleHostMigration(roomId, _departedUserId) {
       a.joinedAt < b.joinedAt ? a : b
     );
 
-    oldest.role = 'host';
+    oldest.promote('host');
     try {
       await promoteToHost(roomId, oldest.userId);
     } catch {
       // DB might be unavailable; in-memory promotion still works
     }
 
-    send(oldest.ws, { type: 'HOST_PROMOTED', userId: oldest.userId });
-    broadcastMemberList(roomId);
+    roomManager.send(oldest.ws, { type: 'HOST_PROMOTED', userId: oldest.userId });
+    roomManager.broadcastMemberList(roomId);
 
     eventBus.emitRoom(roomId, 'room:host_migrated', { newHostId: oldest.userId });
     console.log(`[sync] Host migrated to ${oldest.userId} in room ${roomId}`);
@@ -235,7 +192,7 @@ function handleConnection(ws, _req) {
   ws.on('message', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch {
-      send(ws, { type: 'ERROR', message: 'Invalid JSON' });
+      roomManager.send(ws, { type: 'ERROR', message: 'Invalid JSON' });
       return;
     }
 
@@ -245,26 +202,24 @@ function handleConnection(ws, _req) {
       userId   = msg.userId;
       userRole = msg.role ?? 'guest';
 
-      if (!rooms.has(roomId)) rooms.set(roomId, new Map());
-      const members = rooms.get(roomId);
-
       // NFR-04: Enforce max 10 members per room
-      if (members.size >= 10 && !members.has(userId)) {
-        send(ws, { type: 'ERROR', message: 'Room is full (max 10 users)' });
+      const currentCount = roomManager.getMemberCount(roomId);
+      if (currentCount >= 10 && !roomManager.getMember(roomId, userId)) {
+        roomManager.send(ws, { type: 'ERROR', message: 'Room is full (max 10 users)' });
         ws.close();
         return;
       }
 
-      members.set(userId, {
+      const member = new RoomMember({
         ws, userId, role: userRole,
         displayName: msg.displayName ?? 'Guest',
-        joinedAt: Date.now(),
       });
+      roomManager.addMember(roomId, member);
 
       // FR-03 Late-Join Catch-up: send current playback state immediately
       const snap = await getState(roomId);
       if (snap) {
-        send(ws, {
+        roomManager.send(ws, {
           type: 'CATCHUP',
           url:      snap.url      ?? null,
           position: snap.position ?? 0,
@@ -272,18 +227,18 @@ function handleConnection(ws, _req) {
         });
       }
 
-      broadcastMemberList(roomId);
+      roomManager.broadcastMemberList(roomId);
 
       // Send current queue to the new joiner (FR-05)
       try {
         const queue = await getQueue(roomId);
-        send(ws, { type: 'QUEUE_UPDATE', queue });
+        roomManager.send(ws, { type: 'QUEUE_UPDATE', queue });
       } catch { /* DB unavailable */ }
 
       // FR-10: Send chat history to late joiner
-      const history = chatHistory.get(roomId);
-      if (history && history.length > 0) {
-        send(ws, { type: 'CHAT_HISTORY', messages: history });
+      const history = chatService.getHistory(roomId);
+      if (history.length > 0) {
+        roomManager.send(ws, { type: 'CHAT_HISTORY', messages: history });
       }
 
       eventBus.emitRoom(roomId, 'room:join', { userId, role: userRole });
@@ -293,32 +248,37 @@ function handleConnection(ws, _req) {
 
     // All subsequent messages require a JOIN first
     if (!roomId || !userId) {
-      send(ws, { type: 'ERROR', message: 'Must JOIN first' });
+      roomManager.send(ws, { type: 'ERROR', message: 'Must JOIN first' });
       return;
     }
 
-    const member = rooms.get(roomId)?.get(userId);
+    const member = roomManager.getMember(roomId, userId);
     if (member) userRole = member.role; // keep in sync with any promotions
 
     // ── Command Pattern: Dispatch via Registry ──────────────────────────────
     const CommandClass = CommandRegistry.get(msg.type);
     if (!CommandClass) {
-      send(ws, { type: 'ERROR', message: `Unknown message type: ${msg.type}` });
+      roomManager.send(ws, { type: 'ERROR', message: `Unknown message type: ${msg.type}` });
       return;
     }
 
-    // Build the execution context for this command
+    // Build the execution context for this command (Smell #6: operations, not raw data)
     const context = {
       roomId,
       userId,
       userRole,
       ws,
-      rooms,
-      chatHistory,
+      // Extracted services (replacing raw Maps)
+      roomManager,
+      chatService,
       eventBus,
-      send:                (obj) => send(ws, obj),
-      broadcast:           (obj, exclude) => broadcast(roomId, obj, exclude),
-      broadcastMemberList: ()    => broadcastMemberList(roomId),
+      // Convenience operations scoped to current room/user
+      getMember:           (uid) => roomManager.getMember(roomId, uid ?? userId),
+      getMemberCount:      ()    => roomManager.getMemberCount(roomId),
+      // Communication helpers
+      send:                (obj) => roomManager.send(ws, obj),
+      broadcast:           (obj, exclude) => roomManager.broadcast(roomId, obj, exclude),
+      broadcastMemberList: ()    => roomManager.broadcastMemberList(roomId),
       broadcastQueue:      ()    => broadcastQueue(roomId),
       broadcastSkipStatus: (cnt) => broadcastSkipStatus(roomId, cnt),
       playNextFromQueue:   ()    => playNextFromQueue(roomId),
@@ -329,7 +289,7 @@ function handleConnection(ws, _req) {
     // Validate
     const validation = cmd.validate(msg);
     if (!validation.valid) {
-      send(ws, { type: 'ERROR', message: validation.error });
+      roomManager.send(ws, { type: 'ERROR', message: validation.error });
       return;
     }
 
@@ -338,22 +298,19 @@ function handleConnection(ws, _req) {
       await cmd.execute(msg);
     } catch (err) {
       console.error(`[sync] Command ${msg.type} error:`, err.message);
-      send(ws, { type: 'ERROR', message: `Failed to process ${msg.type}` });
+      roomManager.send(ws, { type: 'ERROR', message: `Failed to process ${msg.type}` });
     }
 
   });
 
   ws.on('close', () => {
     if (!roomId || !userId) return;
-    const members = rooms.get(roomId);
-    if (!members) return;
 
-    const departed = members.get(userId);
-    members.delete(userId);
+    const departed = roomManager.removeMember(roomId, userId);
 
-    if (members.size === 0) {
-      rooms.delete(roomId);
-      chatHistory.delete(roomId); // FR-10: clean up chat history
+    if (roomManager.isEmpty(roomId)) {
+      roomManager.deleteRoom(roomId);
+      chatService.clear(roomId); // FR-10: clean up chat history
       eventBus.teardownRoom(roomId); // Observer cleanup
       console.log(`[sync] Room ${roomId} empty — cleaned up`);
       return;
@@ -364,7 +321,7 @@ function handleConnection(ws, _req) {
       scheduleHostMigration(roomId, userId);
     }
 
-    broadcastMemberList(roomId);
+    roomManager.broadcastMemberList(roomId);
     eventBus.emitRoom(roomId, 'room:leave', { userId });
     console.log(`[sync] ${userId} left room ${roomId}`);
   });

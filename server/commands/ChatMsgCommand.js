@@ -6,8 +6,6 @@
 
 const BaseCommand = require('./BaseCommand');
 
-const MAX_CHAT_HISTORY = 200;
-
 class ChatMsgCommand extends BaseCommand {
   validate(msg) {
     const text = (msg.text ?? '').trim().slice(0, 500);
@@ -19,7 +17,7 @@ class ChatMsgCommand extends BaseCommand {
 
   async execute(msg) {
     const text = (msg.text ?? '').trim().slice(0, 500);
-    const member = this.ctx.rooms.get(this.roomId)?.get(this.userId);
+    const member = this.ctx.getMember(this.userId);
 
     const chatMsg = {
       type: 'CHAT_MSG',
@@ -29,13 +27,8 @@ class ChatMsgCommand extends BaseCommand {
       timestamp: new Date().toISOString(),
     };
 
-    // Store in history
-    if (!this.ctx.chatHistory.has(this.roomId)) {
-      this.ctx.chatHistory.set(this.roomId, []);
-    }
-    const history = this.ctx.chatHistory.get(this.roomId);
-    history.push(chatMsg);
-    if (history.length > MAX_CHAT_HISTORY) history.shift();
+    // Store in history (delegated to ChatService — Smell #3 fix)
+    this.ctx.chatService.append(this.roomId, chatMsg);
 
     // Broadcast to all room members
     this.broadcast(chatMsg);
