@@ -17,7 +17,7 @@ function toast(message, type = 'info', durationMs = 3500) {
   }, durationMs);
 }
 
-// ── Tab switcher ──────────────────────────────────────────────────────────
+// ── Tab switcher ──────────────────────────────────────────────────────────   
 function switchTab(tab) {
   ['create', 'join'].forEach(t => {
     document.getElementById(`tab-${t}`).classList.toggle('active', t === tab);

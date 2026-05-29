@@ -102,6 +102,7 @@ function applyRoleUI() {
   hostControls.classList.toggle('hidden', !isHost);
   hostSeek.classList.toggle('hidden', !isHost);
   guestMsg.classList.toggle('hidden',  isHost);
+  $('sync-video-section').style.display = isHost ? 'none' : 'flex';  // Show sync button for guests
   updateGuestOverlay();
 }
 
@@ -160,12 +161,14 @@ let lastBroadcastSeekAt = 0;
 let lastIdleCheckAt = 0;       // track idle for periodic sync (NEW)
 let lastServerSync = 0;        // track last full server sync (NEW)
 let lastKnownServerSequence = 0;  // track command sequence for verification (NEW)
+let lastSyncMessageTime = 0;   // track when last sync message arrived (NEW)
+let hostSyncResponses = [];    // collect sync responses from hosts (NEW)
 const KEYBOARD_SEEK_STEP_SECONDS = 5;
 const DRIFT_THRESHOLD_SMALL = 0.5;  // small drift always broadcasts (NEW)
 const DRIFT_THRESHOLD_LARGE = 1.5;  // large drift broadcasts (NEW)
 const SUPPRESS_WINDOW_SHORT = 400;  // short suppress for same command (NEW)
-const SYNC_VERIFY_INTERVAL = 10000;  // verify sync every 10s (NEW)
 const ALLOWED_SYNC_DRIFT = 0.5;  // max allowed drift before resync (NEW)
+const SYNC_VERIFY_INTERVAL = 2000;  // verify sync every 2s (NEW)
 
 // Called by YouTube IFrame API when script loads
 window.onYouTubeIframeAPIReady = () => {
@@ -196,7 +199,7 @@ function extractYouTubeVideoId(rawUrl) {
       return parts[embedIndex + 1];
     }
   } catch {
-    return null;
+    return null;                        
   }
 
   return null;
@@ -744,6 +747,7 @@ function handleMessage(msg) {
       logSync(`[CATCHUP] position=${msg.position}, status=${msg.status}`);
       localPosition = msg.position ?? 0;
       localStatus   = msg.status   ?? 'paused';
+      lastSyncMessageTime = Date.now();  // Update sync baseline
       if (msg.url) {
         if (createPlayer(msg.url)) {
           queuePlayerState(
@@ -760,6 +764,7 @@ function handleMessage(msg) {
       logSync(`[PLAY] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
       localStatus   = 'playing';
+      lastSyncMessageTime = Date.now();  // Update sync baseline
       queuePlayerState({ position: localPosition, status: 'playing' });
       btnPlayPause.textContent = '⏸';
       break;
@@ -768,6 +773,7 @@ function handleMessage(msg) {
       logSync(`[PAUSE] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
       localStatus   = 'paused';
+      lastSyncMessageTime = Date.now();  // Update sync baseline
       queuePlayerState({ position: localPosition, status: 'paused' });
       btnPlayPause.textContent = '▶';
       break;
@@ -775,6 +781,7 @@ function handleMessage(msg) {
     case 'SEEK':
       logSync(`[SEEK] position=${msg.position}`);
       localPosition = msg.position ?? localPosition;
+      lastSyncMessageTime = Date.now();  // Update sync baseline
       queuePlayerState({ position: localPosition });
       updateSeekBar();
       break;
@@ -785,6 +792,7 @@ function handleMessage(msg) {
       if (!createPlayer(msg.url)) break;
       localPosition = 0;
       localStatus   = 'paused';
+      lastSyncMessageTime = Date.now();  // Update sync baseline
       endedReportedForCurrentVideo = false;
       queuePlayerState({ position: 0, status: 'paused' });
       updateSeekBar();
@@ -825,11 +833,6 @@ function handleMessage(msg) {
       renderChatReaction(msg);
       break;
 
-    // FR-10: Chat history for late joiners
-    case 'CHAT_HISTORY':
-      renderChatHistory(msg.messages ?? []);
-      break;
-
     // FR-05: Queue is empty (no next video)
     case 'QUEUE_EMPTY':
       toast('Queue is empty — no next video.', 'info');
@@ -843,6 +846,16 @@ function handleMessage(msg) {
     // Sync verification from guests (host only)
     case 'SYNC_CHECK':
       handleSyncCheck(msg);
+      break;
+
+    // Sync request from guest asking for host's current time
+    case 'SYNC_REQUEST':
+      handleSyncRequest(msg);
+      break;
+
+    // Sync response from host with their current time
+    case 'SYNC_RESPONSE':
+      handleSyncResponse(msg);
       break;
   }
  }
@@ -1071,19 +1084,6 @@ function renderChatReaction(msg) {
 /**
  * Render chat history for late joiners (FR-10 + FR-03).
  */
-function renderChatHistory(messages) {
-  if (!messages.length) return;
-  if (chatEmpty) chatEmpty.remove();
-
-  messages.forEach(msg => {
-    if (msg.type === 'CHAT_REACTION') {
-      renderChatReaction(msg);
-    } else {
-      renderChatMessage(msg);
-    }
-  });
-}
-
 // ══════════════════════════════════════════════════════════════════════════
 // FR-08: Display Name Change (mid-session)
 // ══════════════════════════════════════════════════════════════════════════
@@ -1241,17 +1241,26 @@ function startSyncVerification() {
   syncVerificationTimer = setInterval(() => {
     if (videoShell.classList.contains('hidden') || !playerReady) return;
     
+    // Calculate expected position based on time elapsed since last sync message
+    const now = Date.now();
+    const elapsedMs = now - lastSyncMessageTime;
+    const elapsedSec = elapsedMs / 1000;
+    
+    // Expected position advances only if video is playing
+    const expectedPos = localStatus === 'playing' 
+      ? localPosition + elapsedSec
+      : localPosition;
+    
     // Verify we're at expected position
     const actualPos = getPlayerTime();
-    const expectedPos = localPosition;
     const drift = Math.abs(actualPos - expectedPos);
     
     if (drift > ALLOWED_SYNC_DRIFT) {
-      logSync(`[SYNC-VERIFY] DRIFT DETECTED: expected=${expectedPos.toFixed(1)}s, actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
+      logSync(`[SYNC-VERIFY] DRIFT DETECTED: expected=${expectedPos.toFixed(1)}s (base=${localPosition.toFixed(1)}s + elapsed=${elapsedSec.toFixed(1)}s), actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
       // Broadcast our actual position so host can correct us if needed
       sendWs({ type: 'SYNC_CHECK', position: actualPos, expected: expectedPos, drift });
     } else {
-      logSync(`[SYNC-VERIFY] OK - drift=${drift.toFixed(2)}s within tolerance`);
+      logSync(`[SYNC-VERIFY] OK - drift=${drift.toFixed(2)}s within tolerance (actual=${actualPos.toFixed(1)}s, expected=${expectedPos.toFixed(1)}s)`);
     }
   }, SYNC_VERIFY_INTERVAL);
   
@@ -1278,6 +1287,94 @@ function handleSyncCheck(msg) {
   }
 }
 
+// ── Sync Request Handler (NEW) ─────────────────────────────────────────────
+// When a guest asks for sync, host responds with current position
+function handleSyncRequest(msg) {
+  if (!isHostController()) return; // Only hosts respond
+  
+  const hostPos = getPlayerTime();
+  logSync(`[SYNC-REQUEST-RCV] Guest requesting sync, host current position=${hostPos.toFixed(1)}s`);
+  
+  // Send our current position back to the requesting guest
+  sendWs({ type: 'SYNC_RESPONSE', hostId: userId, position: hostPos });
+}
+
+// Collect sync responses from hosts and resync the client
+function handleSyncResponse(msg) {
+  if (isHostController()) return; // Only guests collect responses
+  
+  hostSyncResponses.push({
+    hostId: msg.hostId,
+    position: msg.position
+  });
+  
+  logSync(`[SYNC-RESPONSE-RCV] From host ${msg.hostId?.slice(0,8)}: position=${msg.position.toFixed(1)}s`);
+}
+
+// Guest button: Request sync from all hosts and apply majority/mean position
+function requestSyncFromHosts() {
+  if (isHostController()) {
+    toast('You are the host — sync is automatic.', 'info');
+    return;
+  }
+  
+  if (videoShell.classList.contains('hidden')) {
+    toast('No video loaded yet.', 'warn');
+    return;
+  }
+  
+  // Reset responses array
+  hostSyncResponses = [];
+  
+  logSync(`[SYNC-REQUEST] Guest requesting sync from all hosts`);
+  toast('🔄 Requesting sync from hosts...', 'info');
+  
+  // Send sync request to server (will be broadcast to all hosts)
+  sendWs({ type: 'SYNC_REQUEST' });
+  
+  // Wait for responses and apply after a short delay
+  setTimeout(() => {
+    if (hostSyncResponses.length === 0) {
+      logSync(`[SYNC-APPLY] No host responses received`);
+      toast('No hosts responded — ensure they are active.', 'warn');
+      return;
+    }
+    
+    // Calculate position: mean/median/majority vote of responses
+    const positions = hostSyncResponses.map(r => r.position);
+    let syncPosition;
+    
+    if (positions.length === 1) {
+      syncPosition = positions[0];
+      logSync(`[SYNC-APPLY] Single host response: ${syncPosition.toFixed(1)}s`);
+    } else if (positions.length === 2) {
+      // Use mean for two hosts
+      syncPosition = (positions[0] + positions[1]) / 2;
+      logSync(`[SYNC-APPLY] Two hosts mean: (${positions[0].toFixed(1)} + ${positions[1].toFixed(1)}) / 2 = ${syncPosition.toFixed(1)}s`);
+    } else {
+      // Use median for 3+ hosts
+      const sorted = [...positions].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      syncPosition = sorted.length % 2 === 0 
+        ? (sorted[mid - 1] + sorted[mid]) / 2 
+        : sorted[mid];
+      logSync(`[SYNC-APPLY] Multiple hosts (${positions.length}), using median: ${syncPosition.toFixed(1)}s (positions: ${positions.map(p => p.toFixed(1)).join(', ')})`);
+    }
+    
+    // Seek to the synced position
+    localPosition = syncPosition;
+    lastSyncMessageTime = Date.now();
+    queuePlayerState({ position: syncPosition });
+    updateSeekBar();
+    
+    toast(`✅ Synced to host position: ${fmt(syncPosition)}`, 'success', 3000);
+    logSync(`[SYNC-DONE] Client synced to ${syncPosition.toFixed(1)}s`);
+    
+    // Clear responses for next request
+    hostSyncResponses = [];
+  }, 500); // Wait 500ms for responses to arrive
+}
+
 // ── Enter url with Enter key ──────────────────────────────────────────────
 urlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') loadVideo(); });
 queueUrlInput?.addEventListener('keydown', e => { if (e.key === 'Enter') addToQueue(); });
@@ -1290,6 +1387,7 @@ playerArea?.addEventListener('keydown', handlePlayerAreaKeydown);
   logSync(`[INIT] Role=${role}, UserId=${userId}, RoomId=${roomId}`);
   applyRoleUI();
   showInviteLink();
+  lastSyncMessageTime = Date.now();  // Initialize sync baseline
   if (role === 'guest') {
     emptyHint.textContent = 'Waiting for the host to load a video…';
   }

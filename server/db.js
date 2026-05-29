@@ -64,6 +64,7 @@ try {
   console.warn('[db] pg module error, will use in-memory fallback:', err.message);
   // MemoryStrategy is loaded from memoryDb.js which implements DatabaseStrategy
   strategy = require('./memoryDb');
+
 }
 
 // ── Exported interface (backward-compatible) ──────────────────────────────

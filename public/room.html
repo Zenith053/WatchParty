@@ -383,6 +383,34 @@
       font-variant-numeric: tabular-nums;
     }
 
+    /* Sync Video Button (NEW) */
+    #sync-video-section {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex: 1;
+    }
+    .sync-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 16px;
+      border-radius: var(--radius-md);
+      background: rgba(62, 207, 142, 0.12);
+      border: 1px solid rgba(62, 207, 142, 0.25);
+      color: var(--success);
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background var(--t-fast), transform var(--t-fast);
+    }
+    .sync-btn:hover {
+      background: rgba(62, 207, 142, 0.22);
+      transform: translateY(-1px);
+    }
+    .sync-btn:active { transform: scale(0.97); }
+
     /* ── Playback Controls (host) ── */
     .controls-bar {
       grid-area: controls;
@@ -742,6 +770,13 @@
           ⏭ Skip
         </button>
         <span class="skip-progress" id="skip-progress">0 / 0 votes</span>
+      </div>
+
+      <!-- Sync Video Button (NEW) — guests only -->
+      <div id="sync-video-section" style="display: none;">
+        <button class="sync-btn" onclick="requestSyncFromHosts()" aria-label="Sync with host">
+          🔄 Sync Video
+        </button>
       </div>
 
       <!-- Guest message (shown instead when not host) -->
