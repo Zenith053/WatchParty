@@ -34,6 +34,8 @@
  *     { type: 'CHAT_MSG',    text }     — FR-10: send a chat message
  *     { type: 'CHAT_REACTION', emoji }  — FR-10: send an emoji reaction
  *     { type: 'SET_NAME',   displayName } — FR-08: change display name
+ *     { type: 'SYNC_REQUEST' }          — guest asks hosts for current position
+ *     { type: 'SYNC_RESPONSE', requestedBy, position, status } — host replies to guest
  *
  *   Server → Client:
  *     { type: 'PLAY',         position }
@@ -48,6 +50,8 @@
  *     { type: 'CHAT_MSG',     userId, displayName, text, timestamp }
  *     { type: 'CHAT_REACTION', userId, displayName, emoji, timestamp }
  *     { type: 'CHAT_HISTORY', messages } — sent on JOIN for late joiners
+ *     { type: 'SYNC_REQUEST', requestedBy } — relayed to hosts
+ *     { type: 'SYNC_RESPONSE', hostId, position, status } — sent to requesting guest
  *     { type: 'ERROR',         message }
  */
 'use strict';

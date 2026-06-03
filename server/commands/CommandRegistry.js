@@ -21,6 +21,8 @@ const ChatMsgCommand       = require('./ChatMsgCommand');
 const ChatReactionCommand  = require('./ChatReactionCommand');
 const SetNameCommand       = require('./SetNameCommand');
 const SyncCheckCommand     = require('./SyncCheckCommand');
+const SyncRequestCommand   = require('./SyncRequestCommand');
+const SyncResponseCommand  = require('./SyncResponseCommand');
 
 /**
  * Registry: message type → Command class constructor.
@@ -56,6 +58,8 @@ const registry = new Map([
 
   // Sync verification
   ['SYNC_CHECK',     SyncCheckCommand],
+  ['SYNC_REQUEST',   SyncRequestCommand],
+  ['SYNC_RESPONSE',  SyncResponseCommand],
 ]);
 
 module.exports = registry;

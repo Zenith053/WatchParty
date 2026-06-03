@@ -18,12 +18,14 @@ class SeekCommand extends BaseCommand {
   async execute(msg) {
     const position = parseFloat(msg.position ?? 0);
     const currentState = await getState(this.roomId);
-    const status = currentState?.status ?? 'paused';
+    const status = ['playing', 'paused', 'ended'].includes(msg.status)
+      ? msg.status
+      : currentState?.status ?? 'paused';
 
     await setState(this.roomId, { position, status });
-    this.broadcast({ type: 'SEEK', position });
-    this.emitEvent('playback:seek', { position });
-    console.log(`[sync] SEEK room=${this.roomId} user=${this.userId} position=${position}`);
+    this.broadcast({ type: 'SEEK', position, status });
+    this.emitEvent('playback:seek', { position, status });
+    console.log(`[sync] SEEK room=${this.roomId} user=${this.userId} position=${position} status=${status}`);
   }
 }
 

@@ -162,13 +162,15 @@ let lastIdleCheckAt = 0;       // track idle for periodic sync (NEW)
 let lastServerSync = 0;        // track last full server sync (NEW)
 let lastKnownServerSequence = 0;  // track command sequence for verification (NEW)
 let lastSyncMessageTime = 0;   // track when last sync message arrived (NEW)
+let lastPositionUpdateTime = 0;   // track when position was last officially updated (NEW)
+let lastPositionValue = 0;   // track the position value at last update (NEW)
 let hostSyncResponses = [];    // collect sync responses from hosts (NEW)
 const KEYBOARD_SEEK_STEP_SECONDS = 5;
 const DRIFT_THRESHOLD_SMALL = 0.5;  // small drift always broadcasts (NEW)
 const DRIFT_THRESHOLD_LARGE = 1.5;  // large drift broadcasts (NEW)
 const SUPPRESS_WINDOW_SHORT = 400;  // short suppress for same command (NEW)
 const ALLOWED_SYNC_DRIFT = 0.5;  // max allowed drift before resync (NEW)
-const SYNC_VERIFY_INTERVAL = 2000;  // verify sync every 2s (NEW)
+const SYNC_VERIFY_INTERVAL = 10000;  // verify sync every 10s (NEW)
 
 // Called by YouTube IFrame API when script loads
 window.onYouTubeIframeAPIReady = () => {
@@ -297,7 +299,7 @@ function isHostController() {
 function shouldBroadcastHostControl() {
   return isHostController() &&
     ws?.readyState === WebSocket.OPEN &&
-    Date.now() > suppressHostBroadcastUntil;
+    Date.now() > commandSuppressUntil;
 }
 
 function suppressHostBroadcast(ms = SUPPRESS_WINDOW_SHORT) {
@@ -313,8 +315,9 @@ function broadcastHostPlayback(type, position = getPlayerTime()) {
   if (!shouldBroadcastHostControl()) return false;
   lastCommandType = type;
   commandSuppressUntil = Date.now() + SUPPRESS_WINDOW_SHORT;
-  logSync(`[BROADCAST] type=${type} position=${position.toFixed(1)}s`);
-  return sendWs({ type, position });
+  const status = type === 'PLAY' ? 'playing' : type === 'PAUSE' ? 'paused' : localStatus;
+  logSync(`[BROADCAST] type=${type} position=${position.toFixed(1)}s status=${status}`);
+  return sendWs({ type, position, status });
 }
 
 function canApplyPlayerState() {
@@ -335,8 +338,7 @@ function flushPendingPlayerState() {
           flushPendingPlayerState();
         }, delay);
       } else {
-        logSync(`[ERROR] Max retries reached for state:`, pendingPlayerState);
-        pendingPlayerState = null;
+        logSync(`[WAIT] Player not ready after retries; keeping pending state until ready:`, pendingPlayerState);
         pendingRetryCount = 0;
       }
     }
@@ -361,7 +363,9 @@ function flushPendingPlayerState() {
 
     if (nextState.status === 'playing') {
       logSync(`[PLAY-APPLY]`);
+      console.log("before play", ytPlayer.getPlayerState());
       ytPlayer.playVideo();
+      console.log("after play", ytPlayer.getPlayerState());
     } else if (nextState.status === 'paused') {
       logSync(`[PAUSE-APPLY]`);
       ytPlayer.pauseVideo();
@@ -397,6 +401,7 @@ function handlePlayerReady(event) {
   const iframe = videoFrame?.querySelector('iframe');
   iframe?.setAttribute('tabindex', '-1');
   logSync(`[PLAYER-READY]`);
+  logSync("iframe allow:", event.target.getIframe().allow);
   startSeekPoller();
   syncPlayerSnapshot();
   lastPolledPosition = getPlayerTime();
@@ -547,6 +552,9 @@ function createPlayer(videoUrl) {
   lastBroadcastSeekAt = 0;
   lastIdleCheckAt = Date.now();
   lastServerSync = 0;
+  lastSyncMessageTime = Date.now();  // Reset sync baseline for new video
+  lastPositionUpdateTime = Date.now();  // Reset position tracking
+  lastPositionValue = 0;  // New video starts at 0
 
   // Destroy existing polling
   if (poller) clearInterval(poller);
@@ -635,8 +643,7 @@ function startSeekPoller() {
 
     if (shouldBroadcastHostControl()) {
       if ((drift > DRIFT_THRESHOLD_LARGE && !isSuppressed && timeSinceLastBroadcast > 400) ||
-          (drift > DRIFT_THRESHOLD_SMALL && timeSinceLastBroadcast > 1000) ||
-          (isIdleUpdate && localStatus === 'playing')) {
+          (drift > DRIFT_THRESHOLD_SMALL && timeSinceLastBroadcast > 1000) ) {
         lastBroadcastSeekAt = now;
         lastIdleCheckAt = now;
         logSync(`[DRIFT] ${drift.toFixed(1)}s, broadcasting SEEK`);
@@ -748,6 +755,8 @@ function handleMessage(msg) {
       localPosition = msg.position ?? 0;
       localStatus   = msg.status   ?? 'paused';
       lastSyncMessageTime = Date.now();  // Update sync baseline
+      lastPositionUpdateTime = Date.now();  // Update position tracking
+      lastPositionValue = localPosition;  // Store the position value
       if (msg.url) {
         if (createPlayer(msg.url)) {
           queuePlayerState(
@@ -765,6 +774,8 @@ function handleMessage(msg) {
       localPosition = msg.position ?? localPosition;
       localStatus   = 'playing';
       lastSyncMessageTime = Date.now();  // Update sync baseline
+      lastPositionUpdateTime = Date.now();  // Update position tracking
+      lastPositionValue = localPosition;  // Store the position value
       queuePlayerState({ position: localPosition, status: 'playing' });
       btnPlayPause.textContent = '⏸';
       break;
@@ -774,15 +785,25 @@ function handleMessage(msg) {
       localPosition = msg.position ?? localPosition;
       localStatus   = 'paused';
       lastSyncMessageTime = Date.now();  // Update sync baseline
+      lastPositionUpdateTime = Date.now();  // Update position tracking
+      lastPositionValue = localPosition;  // Store the position value
       queuePlayerState({ position: localPosition, status: 'paused' });
       btnPlayPause.textContent = '▶';
       break;
 
     case 'SEEK':
-      logSync(`[SEEK] position=${msg.position}`);
+      logSync(`[SEEK] position=${msg.position} status=${msg.status ?? localStatus}`);
       localPosition = msg.position ?? localPosition;
+      if (['playing', 'paused', 'ended'].includes(msg.status)) {
+        localStatus = msg.status;
+      }
       lastSyncMessageTime = Date.now();  // Update sync baseline
-      queuePlayerState({ position: localPosition });
+      lastPositionUpdateTime = Date.now();  // Update position tracking
+      lastPositionValue = localPosition;  // Store the position value
+      queuePlayerState({
+        position: localPosition,
+        ...(['playing', 'paused', 'ended'].includes(msg.status) ? { status: msg.status } : {}),
+      });
       updateSeekBar();
       break;
 
@@ -793,6 +814,8 @@ function handleMessage(msg) {
       localPosition = 0;
       localStatus   = 'paused';
       lastSyncMessageTime = Date.now();  // Update sync baseline
+      lastPositionUpdateTime = Date.now();  // Update position tracking
+      lastPositionValue = 0;  // New video starts at 0
       endedReportedForCurrentVideo = false;
       queuePlayerState({ position: 0, status: 'paused' });
       updateSeekBar();
@@ -1241,26 +1264,26 @@ function startSyncVerification() {
   syncVerificationTimer = setInterval(() => {
     if (videoShell.classList.contains('hidden') || !playerReady) return;
     
-    // Calculate expected position based on time elapsed since last sync message
+    // Calculate expected position based on time elapsed since last position update
     const now = Date.now();
-    const elapsedMs = now - lastSyncMessageTime;
+    const elapsedMs = now - lastPositionUpdateTime;
     const elapsedSec = elapsedMs / 1000;
     
     // Expected position advances only if video is playing
     const expectedPos = localStatus === 'playing' 
-      ? localPosition + elapsedSec
-      : localPosition;
+      ? lastPositionValue + elapsedSec
+      : lastPositionValue;
     
     // Verify we're at expected position
     const actualPos = getPlayerTime();
     const drift = Math.abs(actualPos - expectedPos);
     
     if (drift > ALLOWED_SYNC_DRIFT) {
-      logSync(`[SYNC-VERIFY] DRIFT DETECTED: expected=${expectedPos.toFixed(1)}s (base=${localPosition.toFixed(1)}s + elapsed=${elapsedSec.toFixed(1)}s), actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
+      logSync(`[SYNC-VERIFY] DRIFT DETECTED: status=${localStatus}, expected=${expectedPos.toFixed(1)}s (base=${localPosition.toFixed(1)}s + elapsed=${elapsedSec.toFixed(1)}s), actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
       // Broadcast our actual position so host can correct us if needed
-      sendWs({ type: 'SYNC_CHECK', position: actualPos, expected: expectedPos, drift });
+      sendWs({ type: 'SYNC_CHECK', position: actualPos, expected: expectedPos, drift, status: localStatus });
     } else {
-      logSync(`[SYNC-VERIFY] OK - drift=${drift.toFixed(2)}s within tolerance (actual=${actualPos.toFixed(1)}s, expected=${expectedPos.toFixed(1)}s)`);
+      logSync(`[SYNC-VERIFY] OK - status=${localStatus}, drift=${drift.toFixed(2)}s within tolerance (actual=${actualPos.toFixed(1)}s, expected=${expectedPos.toFixed(1)}s)`);
     }
   }, SYNC_VERIFY_INTERVAL);
   
@@ -1274,16 +1297,30 @@ function handleSyncCheck(msg) {
   const guestPos = msg.position;
   const guestExpected = msg.expected;
   const guestDrift = msg.drift;
+  const guestStatus = msg.status ?? 'unknown';
   const hostExpected = localPosition;
   const hostDrift = Math.abs(hostExpected - guestPos);
+  const hostStatus = localStatus;
   
-  logSync(`[SYNC-CHECK-RCV] From guest: pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, host-view-of-guest-pos=${hostExpected.toFixed(1)}s`);
+  logSync(`[SYNC-CHECK-RCV] From guest: status=${guestStatus}, hostStatus=${hostStatus}, pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, host-view-of-guest-pos=${hostExpected.toFixed(1)}s`);
+
+  if (hostStatus === 'playing' && guestStatus !== 'playing') {
+    logSync(`[SYNC-CORRECT] Correcting guest status=${guestStatus}, sending PLAY at ${hostExpected.toFixed(1)}s`);
+    sendWs({ type: 'PLAY', position: hostExpected });
+    return;
+  }
+
+  if (hostStatus === 'paused' && guestStatus === 'playing') {
+    logSync(`[SYNC-CORRECT] Correcting guest status=${guestStatus}, sending PAUSE at ${hostExpected.toFixed(1)}s`);
+    sendWs({ type: 'PAUSE', position: hostExpected });
+    return;
+  }
   
   // If guest has significant drift from host's view, send correction
   if (hostDrift > ALLOWED_SYNC_DRIFT) {
     logSync(`[SYNC-CORRECT] Correcting guest drift=${hostDrift.toFixed(1)}s, sending SEEK to ${hostExpected.toFixed(1)}s`);
     // Send direct correction seek
-    sendWs({ type: 'SEEK', position: hostExpected });
+    sendWs({ type: 'SEEK', position: hostExpected, status: hostStatus });
   }
 }
 
@@ -1296,7 +1333,13 @@ function handleSyncRequest(msg) {
   logSync(`[SYNC-REQUEST-RCV] Guest requesting sync, host current position=${hostPos.toFixed(1)}s`);
   
   // Send our current position back to the requesting guest
-  sendWs({ type: 'SYNC_RESPONSE', hostId: userId, position: hostPos });
+  sendWs({
+    type: 'SYNC_RESPONSE',
+    requestedBy: msg.requestedBy,
+    hostId: userId,
+    position: hostPos,
+    status: localStatus,
+  });
 }
 
 // Collect sync responses from hosts and resync the client
@@ -1305,10 +1348,22 @@ function handleSyncResponse(msg) {
   
   hostSyncResponses.push({
     hostId: msg.hostId,
-    position: msg.position
+    position: msg.position,
+    status: msg.status ?? 'paused',
   });
   
-  logSync(`[SYNC-RESPONSE-RCV] From host ${msg.hostId?.slice(0,8)}: position=${msg.position.toFixed(1)}s`);
+  logSync(`[SYNC-RESPONSE-RCV] From host ${msg.hostId?.slice(0,8)}: position=${msg.position.toFixed(1)}s status=${msg.status ?? 'paused'}`);
+}
+
+function chooseSyncStatus(responses) {
+  const counts = responses.reduce((acc, response) => {
+    const status = ['playing', 'paused', 'ended'].includes(response.status) ? response.status : 'paused';
+    acc[status] = (acc[status] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  return Object.entries(counts)
+    .sort((a, b) => b[1] - a[1] || (a[0] === 'playing' ? -1 : 1))[0]?.[0] ?? 'paused';
 }
 
 // Guest button: Request sync from all hosts and apply majority/mean position
@@ -1343,6 +1398,7 @@ function requestSyncFromHosts() {
     // Calculate position: mean/median/majority vote of responses
     const positions = hostSyncResponses.map(r => r.position);
     let syncPosition;
+    const syncStatus = chooseSyncStatus(hostSyncResponses);
     
     if (positions.length === 1) {
       syncPosition = positions[0];
@@ -1363,12 +1419,14 @@ function requestSyncFromHosts() {
     
     // Seek to the synced position
     localPosition = syncPosition;
+    localStatus = syncStatus;
     lastSyncMessageTime = Date.now();
-    queuePlayerState({ position: syncPosition });
+    queuePlayerState({ position: syncPosition, status: syncStatus });
     updateSeekBar();
+    btnPlayPause.textContent = syncStatus === 'playing' ? '⏸' : '▶';
     
-    toast(`✅ Synced to host position: ${fmt(syncPosition)}`, 'success', 3000);
-    logSync(`[SYNC-DONE] Client synced to ${syncPosition.toFixed(1)}s`);
+    toast(`✅ Synced to host ${syncStatus} position: ${fmt(syncPosition)}`, 'success', 3000);
+    logSync(`[SYNC-DONE] Client synced to ${syncPosition.toFixed(1)}s status=${syncStatus}`);
     
     // Clear responses for next request
     hostSyncResponses = [];
