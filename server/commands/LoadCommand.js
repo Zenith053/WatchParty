@@ -5,7 +5,7 @@
 'use strict';
 
 const BaseCommand = require('./BaseCommand');
-const { setState } = require('../stateStore');
+const { setState, buildPlaybackClock } = require('../stateStore');
 const { clearSkipVotes } = require('../queueService');
 const { normaliseUrl } = require('../urlUtils');
 
@@ -23,9 +23,9 @@ class LoadCommand extends BaseCommand {
 
   async execute(msg) {
     const url = normaliseUrl(msg.url ?? '');
-    await setState(this.roomId, { url, position: 0, status: 'paused' });
+    const snap = await setState(this.roomId, { url, position: 0, status: 'paused' });
     await clearSkipVotes(this.roomId);
-    this.broadcast({ type: 'LOAD', url });
+    this.broadcast({ type: 'LOAD', ...buildPlaybackClock(snap) });
     this.ctx.broadcastSkipStatus(0);
     this.emitEvent('playback:load', { url });
     console.log(`[sync] LOAD room=${this.roomId} user=${this.userId}`);

@@ -34,8 +34,8 @@
  *     { type: 'CHAT_MSG',    text }     — FR-10: send a chat message
  *     { type: 'CHAT_REACTION', emoji }  — FR-10: send an emoji reaction
  *     { type: 'SET_NAME',   displayName } — FR-08: change display name
- *     { type: 'SYNC_REQUEST' }          — guest asks hosts for current position
- *     { type: 'SYNC_RESPONSE', requestedBy, position, status } — host replies to guest
+ *     { type: 'SYNC_REQUEST' }          — member asks server for canonical room timestamp
+ *     { type: 'SYNC_RESPONSE', requestedBy } — legacy host response path; server ignores host time
  *
  *   Server → Client:
  *     { type: 'PLAY',         position }
@@ -50,13 +50,12 @@
  *     { type: 'CHAT_MSG',     userId, displayName, text, timestamp }
  *     { type: 'CHAT_REACTION', userId, displayName, emoji, timestamp }
  *     { type: 'CHAT_HISTORY', messages } — sent on JOIN for late joiners
- *     { type: 'SYNC_REQUEST', requestedBy } — relayed to hosts
- *     { type: 'SYNC_RESPONSE', hostId, position, status } — sent to requesting guest
+ *     { type: 'SYNC_RESPONSE', source:'server', position, status } — canonical sync response
  *     { type: 'ERROR',         message }
  */
 'use strict';
 
-const { setState, getState } = require('./stateStore');
+const { setState, getState, buildPlaybackClock } = require('./stateStore');
 const { promoteToHost }       = require('./roomService');
 const { getQueue, popTopEntry, clearSkipVotes } = require('./queueService');
 const { normaliseUrl }        = require('./urlUtils');
@@ -223,11 +222,11 @@ function handleConnection(ws, _req) {
       // FR-03 Late-Join Catch-up: send current playback state immediately
       const snap = await getState(roomId);
       if (snap) {
+        const clock = buildPlaybackClock(snap);
         roomManager.send(ws, {
           type: 'CATCHUP',
-          url:      snap.url      ?? null,
-          position: snap.position ?? 0,
-          status:   snap.status   ?? 'paused',
+          url:      clock.url      ?? null,
+          ...clock,
         });
       }
 

@@ -5,7 +5,7 @@
 'use strict';
 
 const BaseCommand = require('./BaseCommand');
-const { setState, getState } = require('../stateStore');
+const { setState, getState, buildPlaybackClock } = require('../stateStore');
 
 class SeekCommand extends BaseCommand {
   validate(msg) {
@@ -22,8 +22,8 @@ class SeekCommand extends BaseCommand {
       ? msg.status
       : currentState?.status ?? 'paused';
 
-    await setState(this.roomId, { position, status });
-    this.broadcast({ type: 'SEEK', position, status });
+    const snap = await setState(this.roomId, { position, status });
+    this.broadcast({ type: 'SEEK', ...buildPlaybackClock(snap) });
     this.emitEvent('playback:seek', { position, status });
     console.log(`[sync] SEEK room=${this.roomId} user=${this.userId} position=${position} status=${status}`);
   }

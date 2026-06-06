@@ -5,7 +5,7 @@
 'use strict';
 
 const BaseCommand = require('./BaseCommand');
-const { setState } = require('../stateStore');
+const { setState, buildPlaybackClock } = require('../stateStore');
 
 class PauseCommand extends BaseCommand {
   validate(msg) {
@@ -17,8 +17,8 @@ class PauseCommand extends BaseCommand {
 
   async execute(msg) {
     const position = parseFloat(msg.position ?? 0);
-    await setState(this.roomId, { position, status: 'paused' });
-    this.broadcast({ type: 'PAUSE', position });
+    const snap = await setState(this.roomId, { position, status: 'paused' });
+    this.broadcast({ type: 'PAUSE', ...buildPlaybackClock(snap) });
     this.emitEvent('playback:pause', { position });
     console.log(`[sync] PAUSE room=${this.roomId} user=${this.userId} position=${position}`);
   }

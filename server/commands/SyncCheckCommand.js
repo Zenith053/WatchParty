@@ -11,16 +11,42 @@ class SyncCheckCommand extends BaseCommand {
     const guestPos = parseFloat(msg.position ?? 0);
     const guestExpected = parseFloat(msg.expected ?? 0);
     const guestDrift = parseFloat(msg.drift ?? 0);
+    const guestStatus = ['playing', 'paused', 'ended'].includes(msg.status)
+      ? msg.status
+      : 'unknown';
 
-    // Only host processes and acts on sync checks
     if (this.isAuthorised()) {
       console.log(
-        `[sync] SYNC_CHECK from guest ${this.userId}: ` +
+        `[sync] SYNC_CHECK from host ${this.userId}: ` +
         `pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, ` +
-        `drift=${guestDrift.toFixed(1)}s`
+        `drift=${guestDrift.toFixed(1)}s status=${guestStatus}`
       );
+      return;
     }
-    // Guest just reports, no broadcast needed
+
+    const members = this.ctx.roomManager.getMembers(this.roomId);
+    if (!members) return;
+
+    const syncCheck = {
+      type: 'SYNC_CHECK',
+      userId: this.userId,
+      position: guestPos,
+      expected: guestExpected,
+      drift: guestDrift,
+      status: guestStatus,
+    };
+
+    for (const member of members.values()) {
+      if (member.isHost()) {
+        this.ctx.roomManager.send(member.ws, syncCheck);
+      }
+    }
+
+    console.log(
+      `[sync] SYNC_CHECK from guest ${this.userId}: ` +
+      `pos=${guestPos.toFixed(1)}s, expected=${guestExpected.toFixed(1)}s, ` +
+      `drift=${guestDrift.toFixed(1)}s status=${guestStatus}`
+    );
   }
 }
 

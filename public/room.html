@@ -383,7 +383,7 @@
       font-variant-numeric: tabular-nums;
     }
 
-    /* Sync Video Button (NEW) */
+    /* Sync Now Button */
     #sync-video-section {
       display: flex;
       align-items: center;
@@ -431,6 +431,10 @@
       cursor: pointer;
       accent-color: var(--accent);
     }
+    .seek-bar:disabled {
+      cursor: default;
+      opacity: 0.85;
+    }
     .seek-bar::-webkit-slider-runnable-track {
       background: linear-gradient(
         to right,
@@ -453,10 +457,11 @@
 
     /* Guest controls bar message */
     .guest-controls-msg {
-      flex: 1;
+      flex: 0 0 auto;
       text-align: center;
       font-size: 0.85rem;
       color: var(--text-muted);
+      white-space: nowrap;
     }
 
     /* ── Chat Panel (FR-10) ── */
@@ -772,10 +777,10 @@
         <span class="skip-progress" id="skip-progress">0 / 0 votes</span>
       </div>
 
-      <!-- Sync Video Button (NEW) — guests only -->
+      <!-- Sync Now Button — visible to all members -->
       <div id="sync-video-section" style="display: none;">
-        <button class="sync-btn" onclick="requestSyncFromHosts()" aria-label="Sync with host">
-          🔄 Sync Video
+        <button class="sync-btn" onclick="requestSyncFromHosts()" aria-label="Sync to room timestamp">
+          🔄 Sync Now
         </button>
       </div>
 

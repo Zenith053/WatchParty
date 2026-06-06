@@ -176,6 +176,8 @@ class StateStore {
         // Redis unavailable — memory-only is degraded but functional
       }
     }
+
+    return next;
   }
 
   /**
@@ -228,9 +230,31 @@ class StateStore {
 
 const store = StateStore.getInstance();
 
+function buildPlaybackClock(snapshot, nowMs = Date.now()) {
+  if (!snapshot) return null;
+
+  const basePosition = Number(snapshot.position ?? 0);
+  const safeBasePosition = Number.isFinite(basePosition) && basePosition >= 0 ? basePosition : 0;
+  const status = ['playing', 'paused', 'ended'].includes(snapshot.status) ? snapshot.status : 'paused';
+  const updatedAtMs = Date.parse(snapshot.updatedAt ?? '');
+  const elapsedSeconds = status === 'playing' && Number.isFinite(updatedAtMs)
+    ? Math.max(0, (nowMs - updatedAtMs) / 1000)
+    : 0;
+
+  return {
+    ...snapshot,
+    position: safeBasePosition,
+    basePosition: safeBasePosition,
+    effectivePosition: safeBasePosition + elapsedSeconds,
+    status,
+    serverNow: new Date(nowMs).toISOString(),
+  };
+}
+
 module.exports = {
   setState:    (roomId, snapshot) => store.setState(roomId, snapshot),
   getState:    (roomId)          => store.getState(roomId),
   deleteState: (roomId)          => store.deleteState(roomId),
+  buildPlaybackClock,
   StateStore,  // Export class for testing
 };
