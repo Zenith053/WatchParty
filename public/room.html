@@ -450,6 +450,17 @@
       font-variant-numeric: tabular-nums;
       display: flex; justify-content: space-between;
     }
+    .time-end {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .drift-indicator {
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .drift-indicator.drift-ahead { color: #22c55e; }
+    .drift-indicator.drift-behind { color: #ef4444; }
     .control-btns { display: flex; align-items: center; gap: 8px; }
     .control-btns .btn-icon { background: var(--bg-elevated); border: 1px solid var(--border); color: var(--text-secondary); }
     .control-btns .btn-icon:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -765,7 +776,10 @@
                aria-label="Seek" oninput="onSeekInput(this.value)" onchange="onSeekCommit(this.value)" />
         <div class="time-display">
           <span id="time-current">0:00</span>
-          <span id="time-total">0:00</span>
+          <span class="time-end">
+            <span id="time-total">0:00</span>
+            <span id="drift-indicator" class="drift-indicator hidden" aria-live="polite"></span>
+          </span>
         </div>
       </div>
 

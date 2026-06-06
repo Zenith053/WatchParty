@@ -45,6 +45,7 @@ const btnPlayPause   = $('btn-play-pause');
 const seekBar        = $('seek-bar');
 const timeCurrent    = $('time-current');
 const timeTotal      = $('time-total');
+const driftIndicator = $('drift-indicator');
 const inviteDisplay  = $('invite-display');
 
 // Queue DOM refs (FR-05)
@@ -64,8 +65,6 @@ const chatEmpty      = $('chat-empty');
 
 // Display Name refs (FR-08)
 const nameInput      = $('name-input');
-// const delta = 0;
-// let isSyncTrue = false;
 
 // ── Toast helper ──────────────────────────────────────────────────────────
 function toast(message, type = 'info', durationMs = 3500) {
@@ -177,7 +176,7 @@ const DRIFT_THRESHOLD_SMALL = 0.5;  // small drift always broadcasts (NEW)
 const DRIFT_THRESHOLD_LARGE = 1.5;  // large drift broadcasts (NEW)
 const SUPPRESS_WINDOW_SHORT = 400;  // short suppress for same command (NEW)
 const ALLOWED_SYNC_DRIFT = 0.5;  // max allowed drift before resync (NEW)
-const SYNC_VERIFY_INTERVAL = 10000;  // verify sync every 10s (NEW)
+const SYNC_VERIFY_INTERVAL = 5000;  // verify sync every 10s (NEW)
 
 // Called by YouTube IFrame API when script loads
 window.onYouTubeIframeAPIReady = () => {
@@ -355,6 +354,7 @@ function applyPlaybackClock(msg, fallbackStatus = localStatus) {
   lastSyncMessageTime = Date.now();
   lastPositionUpdateTime = Date.now();
   lastPositionValue = nextPosition;
+  clearDriftIndicator();
 
   return { position: nextPosition, status: nextStatus };
 }
@@ -595,6 +595,7 @@ function createPlayer(videoUrl) {
   lastSyncMessageTime = Date.now();  // Reset sync baseline for new video
   lastPositionUpdateTime = Date.now();  // Reset position tracking
   lastPositionValue = 0;  // New video starts at 0
+  clearDriftIndicator();
   renderSeekBar(0, 0);
 
   // Destroy existing polling
@@ -682,6 +683,28 @@ function startSeekPoller() {
 let localPosition  = 0;
 let localStatus    = 'paused';
 let localDuration  = 0;  // set once known
+let activeDriftSeconds = 0;
+
+function setDriftIndicator(driftSeconds = 0) {
+  activeDriftSeconds = Number.isFinite(driftSeconds) ? driftSeconds : 0;
+
+  if (!driftIndicator) return;
+
+  const driftMagnitude = Math.abs(activeDriftSeconds);
+  if (driftMagnitude <= ALLOWED_SYNC_DRIFT) {
+    driftIndicator.textContent = '';
+    driftIndicator.className = 'drift-indicator hidden';
+    return;
+  }
+
+  const isAhead = activeDriftSeconds > 0;
+  driftIndicator.textContent = `${isAhead ? 'Ahead' : 'Behind'} ${driftMagnitude.toFixed(1)}s`;
+  driftIndicator.className = `drift-indicator ${isAhead ? 'drift-ahead' : 'drift-behind'}`;
+}
+
+function clearDriftIndicator() {
+  setDriftIndicator(0);
+}
 
 function renderSeekBar(position = localPosition, duration = localDuration) {
   const pct = duration > 0 ? (clampPosition(position, duration) / duration) * 100 : 0;
@@ -689,14 +712,8 @@ function renderSeekBar(position = localPosition, duration = localDuration) {
   seekBar.style.setProperty('--progress', `${seekBar.value}%`);
   timeCurrent.textContent = fmt(position);
   timeTotal.textContent = fmt(duration);
+  setDriftIndicator(activeDriftSeconds);
 }
-
-// function fmtTotal(localPosition, delta, isSyncTrue) {
-//     if (isSyncTrue) return fmt(localDuration);
-
-//     const sign = delta >= 0 ? "+" : "";
-//     return `${fmt(localDuration)} / ${sign}${delta.toFixed(1)}s`;
-// }
 
 function updateSeekBar() {
   if (seekPending) return;
@@ -1318,13 +1335,15 @@ function startSyncVerification() {
     
     // Verify we're at expected position
     const actualPos = getPlayerTime();
-    const drift = Math.abs(actualPos - expectedPos);
+    const signedDrift = actualPos - expectedPos;
+    const drift = Math.abs(signedDrift);
     
     if (drift > ALLOWED_SYNC_DRIFT) {
-      logSync(`[SYNC-VERIFY] DRIFT DETECTED: status=${localStatus}, expected=${expectedPos.toFixed(1)}s (base=${localPosition.toFixed(1)}s + elapsed=${elapsedSec.toFixed(1)}s), actual=${actualPos.toFixed(1)}s, diff=${drift.toFixed(1)}s`);
-      logSync(`[SYNC-VERIFY] Requesting canonical room timestamp`);
-      sendWs({ type: 'SYNC_REQUEST' });
+      setDriftIndicator(signedDrift);
+      renderSeekBar(actualPos, localDuration);
+      logSync(`[SYNC-VERIFY] DRIFT DETECTED: status=${localStatus}, expected=${expectedPos.toFixed(1)}s (base=${localPosition.toFixed(1)}s + elapsed=${elapsedSec.toFixed(1)}s), actual=${actualPos.toFixed(1)}s, diff=${signedDrift.toFixed(1)}s`);
     } else {
+      clearDriftIndicator();
       logSync(`[SYNC-VERIFY] OK - status=${localStatus}, drift=${drift.toFixed(2)}s within tolerance (actual=${actualPos.toFixed(1)}s, expected=${expectedPos.toFixed(1)}s)`);
     }
   }, SYNC_VERIFY_INTERVAL);
@@ -1349,8 +1368,6 @@ function handleSyncCheck(msg) {
   // Clients request the canonical room timestamp from the server instead.
   if (hostDrift > ALLOWED_SYNC_DRIFT) {
     logSync(`[SYNC-INFO] Guest has drift=${hostDrift.toFixed(1)}s from room position=${hostExpected.toFixed(1)}s (guest=${guestPos.toFixed(1)}s).`);
-    // isSyncTrue = false;
-    // delta = hostExpected - guestPos;
   }
 }
 
